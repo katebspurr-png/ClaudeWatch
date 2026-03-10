@@ -2,14 +2,7 @@
 """
 Claude Monitor — Mac Menu Bar App
 ===================================
-Shows Claude.ai usage % (5-hour session and 7-day) in the menu bar,
-read directly from the Claude desktop app's decrypted cookies.
-
-Setup:
-    pip install rumps requests pycryptodome
-
-Run:
-    python3 claude_monitor.py
+Shows Claude.ai usage % in the menu bar and a local analytics dashboard.
 """
 
 import rumps
@@ -20,7 +13,7 @@ import hashlib
 import sqlite3
 import subprocess
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 try:
     import requests
@@ -31,18 +24,20 @@ except ImportError:
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 
-CONFIG_DIR = Path.home() / ".claude_monitor"
+CONFIG_DIR  = Path.home() / ".claude_monitor"
 CONFIG_FILE = CONFIG_DIR / "config.json"
-COOKIES_DB = Path.home() / "Library/Application Support/Claude/Cookies"
-ICON_PATH = str(CONFIG_DIR / "TrayIconTemplate.png")
+DB_PATH     = CONFIG_DIR / "history.db"
+DASH_PATH   = CONFIG_DIR / "dashboard.html"
+COOKIES_DB  = Path.home() / "Library/Application Support/Claude/Cookies"
+ICON_PATH   = str(CONFIG_DIR / "TrayIconTemplate.png")
 
 CLAUDE_USAGE_URL = "https://claude.ai/settings/usage"
 
 DEFAULT_CONFIG = {
     "refresh_interval_minutes": 5,
-    "show_session_pct": True,
-    "show_weekly_pct": True,
-    "show_reset_time": False,
+    "show_session_pct":   True,
+    "show_weekly_pct":    True,
+    "show_reset_time":    False,
     "show_hover_tooltip": True,
 }
 
@@ -89,7 +84,7 @@ def get_claude_cookies():
 
 def fetch_claude_usage():
     cookies = get_claude_cookies()
-    org_id = cookies.get("lastActiveOrg", "")
+    org_id  = cookies.get("lastActiveOrg", "")
     if not org_id:
         raise RuntimeError("Could not determine org ID from cookies")
 
@@ -102,8 +97,8 @@ def fetch_claude_usage():
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                       "AppleWebKit/537.36 (KHTML, like Gecko) Claude/1.0",
-        "Accept": "application/json",
-        "Referer": "https://claude.ai/",
+        "Accept":   "application/json",
+        "Referer":  "https://claude.ai/",
     })
 
     resp = session.get(
@@ -112,9 +107,9 @@ def fetch_claude_usage():
     resp.raise_for_status()
     data = resp.json()
 
-    five_hour = data.get("five_hour") or {}
-    seven_day  = data.get("seven_day")  or {}
-    extra      = data.get("extra_usage") or {}
+    five_hour = data.get("five_hour")  or {}
+    seven_day = data.get("seven_day")  or {}
+    extra     = data.get("extra_usage") or {}
 
     return {
         "session_pct":       five_hour.get("utilization", 0.0),
@@ -124,6 +119,362 @@ def fetch_claude_usage():
         "extra_used":        extra.get("used_credits"),
         "extra_limit":       extra.get("monthly_limit"),
     }
+
+
+# ─── History DB ──────────────────────────────────────────────────────────────
+
+def init_db():
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS usage_log (
+            ts               TEXT PRIMARY KEY,
+            session_pct      REAL,
+            weekly_pct       REAL,
+            session_resets_at TEXT,
+            weekly_resets_at TEXT,
+            extra_used       REAL,
+            extra_limit      REAL
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def log_usage(usage):
+    ts = datetime.now(timezone.utc).isoformat()
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        conn.execute("""
+            INSERT OR IGNORE INTO usage_log
+              (ts, session_pct, weekly_pct, session_resets_at, weekly_resets_at,
+               extra_used, extra_limit)
+            VALUES (?,?,?,?,?,?,?)
+        """, (
+            ts,
+            usage["session_pct"],
+            usage["weekly_pct"],
+            usage.get("session_resets_at", ""),
+            usage.get("weekly_resets_at",  ""),
+            usage.get("extra_used"),
+            usage.get("extra_limit"),
+        ))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def load_history(days=14):
+    """Return rows from the last N days, oldest first."""
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    conn  = sqlite3.connect(str(DB_PATH))
+    try:
+        rows = conn.execute(
+            "SELECT ts, session_pct, weekly_pct, weekly_resets_at, extra_used, extra_limit "
+            "FROM usage_log WHERE ts >= ? ORDER BY ts ASC",
+            (since,)
+        ).fetchall()
+    finally:
+        conn.close()
+    return rows
+
+
+# ─── Analytics ───────────────────────────────────────────────────────────────
+
+def calculate_stats(usage, rows):
+    """
+    Derive burn rate, projection, and daily budget from history.
+    `usage` is the latest reading dict.
+    `rows`  is [(ts, session_pct, weekly_pct, weekly_resets_at, extra_used, extra_limit), ...]
+    """
+    weekly_resets_at = usage.get("weekly_resets_at", "")
+    try:
+        reset_dt     = datetime.fromisoformat(weekly_resets_at.replace("Z", "+00:00"))
+        period_start = reset_dt - timedelta(days=7)
+    except Exception:
+        return None
+
+    now = datetime.now(timezone.utc)
+
+    # Filter to current weekly period, detect & drop resets
+    period_rows = []
+    prev_pct    = None
+    for ts, s_pct, w_pct, *_ in rows:
+        try:
+            dt = datetime.fromisoformat(ts)
+        except Exception:
+            continue
+        if dt < period_start:
+            continue
+        if prev_pct is not None and w_pct < prev_pct - 5:
+            # Usage dropped — weekly reset happened mid-history, restart
+            period_rows = []
+        period_rows.append((dt, w_pct))
+        prev_pct = w_pct
+
+    if len(period_rows) < 2:
+        return None
+
+    # Burn rate — compare first and last reading in current period
+    first_dt, first_pct = period_rows[0]
+    last_dt,  last_pct  = period_rows[-1]
+    hours_elapsed = max((last_dt - first_dt).total_seconds() / 3600, 0.01)
+    burn_per_hour = (last_pct - first_pct) / hours_elapsed
+    burn_per_day  = burn_per_hour * 24
+
+    # Days until weekly reset
+    days_until_reset = max((reset_dt - now).total_seconds() / 86400, 0.01)
+
+    # Projection: hours until 100%
+    remaining = max(100 - last_pct, 0)
+    if burn_per_hour > 0:
+        hours_until_full = remaining / burn_per_hour
+        projected_full   = now + timedelta(hours=hours_until_full)
+        hits_limit       = hours_until_full < days_until_reset * 24
+    else:
+        projected_full = None
+        hits_limit     = False
+
+    # Daily budget to stay within limit
+    daily_budget = remaining / days_until_reset
+
+    # Chart series — one point per hour (max per hour bucket)
+    buckets = {}
+    for dt, pct in period_rows:
+        key = dt.strftime("%Y-%m-%dT%H:00")
+        buckets[key] = max(buckets.get(key, 0), pct)
+    chart_labels = sorted(buckets)
+    chart_values = [buckets[k] for k in chart_labels]
+
+    return {
+        "burn_per_hour":    burn_per_hour,
+        "burn_per_day":     burn_per_day,
+        "days_until_reset": days_until_reset,
+        "projected_full":   projected_full,
+        "hits_limit":       hits_limit,
+        "daily_budget":     daily_budget,
+        "chart_labels":     chart_labels,
+        "chart_values":     chart_values,
+        "readings_count":   len(period_rows),
+    }
+
+
+def _tip(usage, stats):
+    wpct = usage["weekly_pct"]
+    spct = usage["session_pct"]
+    if stats is None:
+        return "Keep using Claude and your dashboard will fill in over the next few hours."
+    if stats["hits_limit"]:
+        days = stats["days_until_reset"]
+        return (f"⚠️ At this burn rate you'll hit your weekly limit before the reset "
+                f"({days:.1f} days away). Switch to Haiku for lighter tasks to stretch your credits.")
+    if wpct > 80:
+        return "You're running high on weekly credits. Save Opus and Sonnet for complex tasks — use Haiku for Q&A and quick lookups."
+    if spct > 70:
+        return "Your 5-hour session is getting full. It resets automatically — consider pausing heavy work until it refreshes."
+    if stats["burn_per_day"] > stats["daily_budget"] * 1.3:
+        return "You're burning faster than your daily budget. Consider batching smaller questions into single prompts to save credits."
+    if wpct < 30 and stats["days_until_reset"] < 2:
+        return "You have plenty of credits with only a couple of days until reset — great time to tackle that complex project with Opus."
+    return "You're on track. Keep using the right model for the job: Haiku for quick tasks, Sonnet for most work, Opus for deep reasoning."
+
+
+# ─── Dashboard HTML ──────────────────────────────────────────────────────────
+
+def generate_dashboard(usage, stats):
+    spct     = usage["session_pct"]
+    wpct     = usage["weekly_pct"]
+    sreset   = _fmt_reset(usage.get("session_resets_at", ""))
+    wreset   = _fmt_reset(usage.get("weekly_resets_at",  ""))
+    eu       = usage.get("extra_used")
+    el       = usage.get("extra_limit")
+    tip      = _tip(usage, stats)
+    now_str  = datetime.now().strftime("%b %d, %Y  %I:%M %p")
+
+    # Colour for weekly bar
+    if wpct >= 85:
+        w_color = "#ef4444"
+    elif wpct >= 60:
+        w_color = "#f59e0b"
+    else:
+        w_color = "#D97757"
+
+    # Projection line
+    if stats and stats["projected_full"]:
+        pf = stats["projected_full"]
+        days_away = (pf - datetime.now(timezone.utc)).total_seconds() / 86400
+        if days_away < 1:
+            proj_str = f"⚠️ Weekly limit projected in <b>{days_away*24:.0f} hours</b>"
+        else:
+            proj_str = f"Weekly limit projected in <b>{days_away:.1f} days</b> ({pf.strftime('%A %b %d')})"
+        proj_color = "#ef4444" if stats["hits_limit"] else "#6b7280"
+    else:
+        proj_str   = "Not enough data for projection yet"
+        proj_color = "#6b7280"
+
+    # Chart data
+    if stats and len(stats["chart_labels"]) > 1:
+        chart_labels = json.dumps(
+            [datetime.fromisoformat(l).strftime("%-I%p %-m/%-d") for l in stats["chart_labels"]]
+        )
+        chart_values = json.dumps(stats["chart_values"])
+        chart_html = f"""
+        <div class="card">
+          <h2>Weekly Usage Over Time</h2>
+          <canvas id="chart" height="90"></canvas>
+        </div>
+        <script>
+        new Chart(document.getElementById('chart'), {{
+          type: 'line',
+          data: {{
+            labels: {chart_labels},
+            datasets: [{{
+              label: 'Weekly %',
+              data: {chart_values},
+              borderColor: '#D97757',
+              backgroundColor: 'rgba(217,119,87,0.1)',
+              borderWidth: 2,
+              pointRadius: 2,
+              fill: true,
+              tension: 0.3,
+            }}]
+          }},
+          options: {{
+            plugins: {{ legend: {{ display: false }} }},
+            scales: {{
+              y: {{ min: 0, max: 100, ticks: {{ callback: v => v + '%' }} }},
+              x: {{ ticks: {{ maxTicksLimit: 8 }} }}
+            }}
+          }}
+        }});
+        </script>"""
+    else:
+        chart_html = """
+        <div class="card muted">
+          <h2>Weekly Usage Over Time</h2>
+          <p>Chart will appear after a few hours of data collection.</p>
+        </div>"""
+
+    # Stats cards
+    if stats:
+        burn_str   = f"{stats['burn_per_day']:.1f}% / day"
+        budget_str = f"{stats['daily_budget']:.1f}% / day"
+        reset_str  = f"{stats['days_until_reset']:.1f} days"
+    else:
+        burn_str = budget_str = reset_str = "—"
+
+    extra_html = ""
+    if eu is not None and el:
+        epct = eu / el * 100
+        extra_html = f"""
+        <div class="card">
+          <h2>Extra Credits</h2>
+          <div class="bar-wrap">
+            <div class="bar" style="width:{min(epct,100):.1f}%;background:#6366f1"></div>
+          </div>
+          <div class="bar-labels">
+            <span>{eu:.0f} used</span><span>{el:.0f} total</span>
+          </div>
+        </div>"""
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ClaudeWatch Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<style>
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  :root{{
+    --bg:#f5f5f5;--surface:#fff;--text:#1a1a1a;--muted:#6b7280;
+    --accent:#D97757;--border:#e5e7eb;--radius:12px;
+  }}
+  @media(prefers-color-scheme:dark){{
+    :root{{--bg:#111;--surface:#1c1c1e;--text:#f5f5f5;--muted:#9ca3af;--border:#2d2d2d}}
+  }}
+  body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+        background:var(--bg);color:var(--text);padding:24px;max-width:720px;margin:0 auto}}
+  h1{{font-size:1.4rem;font-weight:700;display:flex;align-items:center;gap:8px;margin-bottom:4px}}
+  .sub{{color:var(--muted);font-size:.85rem;margin-bottom:24px}}
+  .grid{{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}}
+  @media(max-width:500px){{.grid{{grid-template-columns:1fr}}}}
+  .card{{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+         padding:18px}}
+  .card h2{{font-size:.8rem;font-weight:600;color:var(--muted);text-transform:uppercase;
+            letter-spacing:.05em;margin-bottom:12px}}
+  .big{{font-size:2.2rem;font-weight:700;line-height:1;margin-bottom:4px}}
+  .label{{font-size:.8rem;color:var(--muted)}}
+  .bar-wrap{{background:var(--border);border-radius:99px;height:8px;overflow:hidden;margin:10px 0 6px}}
+  .bar{{height:100%;border-radius:99px;transition:width .4s ease}}
+  .bar-labels{{display:flex;justify-content:space-between;font-size:.75rem;color:var(--muted)}}
+  .stats{{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:16px}}
+  @media(max-width:500px){{.stats{{grid-template-columns:1fr 1fr}}}}
+  .stat{{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+         padding:14px}}
+  .stat .val{{font-size:1.4rem;font-weight:700;margin-bottom:2px}}
+  .stat .lbl{{font-size:.75rem;color:var(--muted)}}
+  .tip{{background:var(--surface);border:1px solid var(--border);border-left:3px solid var(--accent);
+        border-radius:var(--radius);padding:16px;margin-bottom:16px;font-size:.9rem;line-height:1.5}}
+  .proj{{font-size:.85rem;color:{proj_color};margin-top:4px}}
+  .muted p{{color:var(--muted);font-size:.9rem;padding:12px 0}}
+  .footer{{text-align:center;font-size:.75rem;color:var(--muted);margin-top:24px}}
+  .reset-badge{{font-size:.75rem;color:var(--muted);margin-top:4px}}
+</style>
+</head>
+<body>
+<h1>
+  <svg width="20" height="20" viewBox="0 0 100 100" fill="none">
+    <circle cx="50" cy="50" r="48" fill="#D97757"/>
+    <text x="50" y="67" text-anchor="middle" font-size="52" fill="white" font-family="-apple-system">◈</text>
+  </svg>
+  ClaudeWatch
+</h1>
+<p class="sub">Updated {now_str}</p>
+
+<div class="tip">{tip}</div>
+
+<div class="grid">
+  <div class="card">
+    <h2>Session Usage (5h)</h2>
+    <div class="big">{spct:.0f}%</div>
+    <div class="bar-wrap"><div class="bar" style="width:{min(spct,100):.1f}%;background:#D97757"></div></div>
+    <div class="bar-labels"><span>used</span><span>100%</span></div>
+    <div class="reset-badge">{f"resets in {sreset}" if sreset else ""}</div>
+  </div>
+  <div class="card">
+    <h2>Weekly Usage (7d)</h2>
+    <div class="big" style="color:{w_color}">{wpct:.0f}%</div>
+    <div class="bar-wrap"><div class="bar" style="width:{min(wpct,100):.1f}%;background:{w_color}"></div></div>
+    <div class="bar-labels"><span>used</span><span>100%</span></div>
+    <div class="reset-badge">{f"resets in {wreset}" if wreset else ""}</div>
+    <div class="proj">{proj_str}</div>
+  </div>
+</div>
+
+<div class="stats">
+  <div class="stat">
+    <div class="val">{burn_str}</div>
+    <div class="lbl">Burn rate</div>
+  </div>
+  <div class="stat">
+    <div class="val">{budget_str}</div>
+    <div class="lbl">Daily budget to stay safe</div>
+  </div>
+  <div class="stat">
+    <div class="val">{reset_str}</div>
+    <div class="lbl">Days until weekly reset</div>
+  </div>
+</div>
+
+{extra_html}
+{chart_html}
+
+<div class="footer">ClaudeWatch · data from Claude desktop app · <a href="{CLAUDE_USAGE_URL}" style="color:var(--accent)">open claude.ai</a></div>
+</body>
+</html>"""
+
+    DASH_PATH.write_text(html, encoding="utf-8")
+    return str(DASH_PATH)
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -147,7 +498,7 @@ def _fmt_reset(iso_str):
     if not iso_str:
         return ""
     try:
-        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        dt   = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
         mins = int((dt - datetime.now(timezone.utc)).total_seconds() / 60)
         if mins <= 0:
             return "now"
@@ -181,10 +532,10 @@ def _build_title(usage, config):
 def _build_tooltip(usage):
     if usage is None:
         return "ClaudeWatch — no data"
-    spct  = usage.get("session_pct", 0)
-    wpct  = usage.get("weekly_pct", 0)
-    sr    = _fmt_reset(usage.get("session_resets_at", ""))
-    wr    = _fmt_reset(usage.get("weekly_resets_at", ""))
+    spct = usage.get("session_pct", 0)
+    wpct = usage.get("weekly_pct",  0)
+    sr   = _fmt_reset(usage.get("session_resets_at", ""))
+    wr   = _fmt_reset(usage.get("weekly_resets_at",  ""))
     lines = [
         "ClaudeWatch",
         f"Session (5h):  {spct:.0f}%" + (f"  —  resets in {sr}" if sr else ""),
@@ -209,10 +560,14 @@ class ClaudeMonitorApp(rumps.App):
             quit_button=None,
         )
 
-        self.config = load_config()
-        self._usage = None
+        self.config   = load_config()
+        self._usage   = None
+        self._stats   = None
 
-        # Settings — toggleable checkmark items
+        if DEPS_OK:
+            init_db()
+
+        # Settings checkmark items
         self._s_session = rumps.MenuItem("Session % (5h)", callback=self._toggle("show_session_pct"))
         self._s_weekly  = rumps.MenuItem("Weekly % (7d)",  callback=self._toggle("show_weekly_pct"))
         self._s_reset   = rumps.MenuItem("Reset time",     callback=self._toggle("show_reset_time"))
@@ -230,27 +585,27 @@ class ClaudeMonitorApp(rumps.App):
         ])
 
         self.menu = [
-            rumps.MenuItem("Open Claude Usage", callback=self.open_usage),
+            rumps.MenuItem("Open Claude Usage",  callback=self.open_usage),
+            rumps.MenuItem("View Dashboard",     callback=self.open_dashboard),
             None,
-            rumps.MenuItem("⬤  Session (5h)", callback=None),
-            rumps.MenuItem("   —", callback=None),
-            rumps.MenuItem("⬤  Weekly (7d)", callback=None),
-            rumps.MenuItem("   —  ", callback=None),
+            rumps.MenuItem("⬤  Session (5h)",   callback=None),
+            rumps.MenuItem("   —",               callback=None),
+            rumps.MenuItem("⬤  Weekly (7d)",    callback=None),
+            rumps.MenuItem("   —  ",             callback=None),
             None,
             settings,
-            rumps.MenuItem("Refresh Now", callback=self.manual_refresh),
+            rumps.MenuItem("Refresh Now",        callback=self.manual_refresh),
             None,
-            rumps.MenuItem("Quit", callback=self.quit_app),
+            rumps.MenuItem("Quit",               callback=self.quit_app),
         ]
 
         if DEPS_OK:
             self._start_timer()
             threading.Thread(target=self._refresh, daemon=True).start()
 
-    # ── Settings toggles ──
+    # ── Settings ──
 
     def _toggle(self, key):
-        """Return a callback that flips a boolean config key and refreshes the UI."""
         def callback(_):
             self.config[key] = not self.config.get(key, True)
             save_config(self.config)
@@ -260,9 +615,9 @@ class ClaudeMonitorApp(rumps.App):
         return callback
 
     def _sync_checkmarks(self):
-        self._s_session.state = int(bool(self.config.get("show_session_pct", True)))
-        self._s_weekly.state  = int(bool(self.config.get("show_weekly_pct",  True)))
-        self._s_reset.state   = int(bool(self.config.get("show_reset_time",  False)))
+        self._s_session.state = int(bool(self.config.get("show_session_pct",   True)))
+        self._s_weekly.state  = int(bool(self.config.get("show_weekly_pct",    True)))
+        self._s_reset.state   = int(bool(self.config.get("show_reset_time",    False)))
         self._s_tooltip.state = int(bool(self.config.get("show_hover_tooltip", True)))
 
     # ── Tooltip ──
@@ -278,6 +633,15 @@ class ClaudeMonitorApp(rumps.App):
     @rumps.clicked("Open Claude Usage")
     def open_usage(self, _):
         webbrowser.open(CLAUDE_USAGE_URL)
+
+    @rumps.clicked("View Dashboard")
+    def open_dashboard(self, _):
+        if self._usage:
+            path = generate_dashboard(self._usage, self._stats)
+            webbrowser.open(f"file://{path}")
+        else:
+            rumps.notification("ClaudeWatch", "No data yet", "Fetching usage now…")
+            threading.Thread(target=self._refresh, daemon=True).start()
 
     @rumps.clicked("Refresh Now")
     def manual_refresh(self, _):
@@ -298,8 +662,11 @@ class ClaudeMonitorApp(rumps.App):
 
     def _refresh(self):
         try:
-            usage = fetch_claude_usage()
-            self._usage = usage
+            usage        = fetch_claude_usage()
+            self._usage  = usage
+            log_usage(usage)
+            rows         = load_history()
+            self._stats  = calculate_stats(usage, rows)
             self._apply_ui(usage)
         except Exception as e:
             self._apply_ui(None, error=str(e))
@@ -316,16 +683,13 @@ class ClaudeMonitorApp(rumps.App):
             self._set_tooltip(f"ClaudeWatch — error\n{error[:120]}")
             return
 
-        # Menu bar title
         self.title = _build_title(usage, self.config)
 
-        # Hover tooltip
         if self.config.get("show_hover_tooltip", True):
             self._set_tooltip(_build_tooltip(usage))
         else:
             self._set_tooltip("")
 
-        # Menu items
         spct   = usage["session_pct"]
         wpct   = usage["weekly_pct"]
         sreset = _fmt_reset(usage["session_resets_at"])

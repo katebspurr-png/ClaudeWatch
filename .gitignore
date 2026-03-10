@@ -1,0 +1,12 @@
+# py2app build artifacts
+build/
+dist/
+
+# Virtual environment
+venv/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log

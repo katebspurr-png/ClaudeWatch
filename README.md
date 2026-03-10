@@ -25,6 +25,14 @@ Click the icon to see reset times, extra credit usage, and a link to the full us
 
 ---
 
+## Installing the DMG
+
+> **Gatekeeper warning:** ClaudeWatch is not signed with an Apple Developer certificate, so macOS will block it on first launch.
+>
+> To open it: **right-click** (or Control-click) `ClaudeWatch.app` → **Open** → **Open** again in the dialog. You only need to do this once.
+
+---
+
 ## Setup
 
 ```bash

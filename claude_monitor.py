@@ -41,6 +41,9 @@ DEFAULT_CONFIG = {
     "show_hover_tooltip": True,
 }
 
+CREDITS_PER_DOLLAR = 100   # 1 credit = $0.01 (confirmed against billing)
+WARN_THRESHOLDS    = [80, 90, 100]  # % weekly usage to notify at
+
 
 # ─── Cookie decryption ───────────────────────────────────────────────────────
 
@@ -477,15 +480,19 @@ def generate_dashboard(usage, stats):
 
     extra_html = ""
     if eu is not None and el:
-        epct = eu / el * 100
+        epct     = eu / el * 100
+        eu_usd   = eu / CREDITS_PER_DOLLAR
+        el_usd   = el / CREDITS_PER_DOLLAR
         extra_html = f"""
         <div class="card">
-          <h2>Extra Credits</h2>
-          <div class="bar-wrap">
+          <h2>Extra Usage</h2>
+          <div class="big" style="font-size:1.6rem">${eu_usd:.2f}</div>
+          <div class="label">of ${el_usd:.2f} monthly cap</div>
+          <div class="bar-wrap" style="margin-top:10px">
             <div class="bar" style="width:{min(epct,100):.1f}%;background:#6366f1"></div>
           </div>
           <div class="bar-labels">
-            <span>{eu:.0f} used</span><span>{el:.0f} total</span>
+            <span>{epct:.1f}% used</span><span>${el_usd:.2f} max</span>
           </div>
         </div>"""
 
@@ -658,7 +665,7 @@ def _build_tooltip(usage):
     eu = usage.get("extra_used")
     el = usage.get("extra_limit")
     if eu is not None and el:
-        lines.append(f"Extra credits: {eu:.0f} / {el:.0f}")
+        lines.append(f"Extra usage:  ${eu/CREDITS_PER_DOLLAR:.2f} / ${el/CREDITS_PER_DOLLAR:.2f}")
     return "\n".join(lines)
 
 
@@ -674,9 +681,10 @@ class ClaudeMonitorApp(rumps.App):
             quit_button=None,
         )
 
-        self.config   = load_config()
-        self._usage   = None
-        self._stats   = None
+        self.config          = load_config()
+        self._usage          = None
+        self._stats          = None
+        self._warned_at      = set()   # thresholds already notified this week
 
         if DEPS_OK:
             init_db()
@@ -817,8 +825,41 @@ class ClaudeMonitorApp(rumps.App):
             rows         = load_history()
             self._stats  = calculate_stats(usage, rows)
             self._apply_ui(usage)
+            self._check_limits(usage)
         except Exception as e:
             self._apply_ui(None, error=str(e))
+
+    def _check_limits(self, usage):
+        wpct   = usage["weekly_pct"]
+        wreset = usage.get("weekly_resets_at", "")
+
+        # Reset warned set when a new weekly period starts
+        try:
+            reset_dt  = datetime.fromisoformat(wreset.replace("Z", "+00:00"))
+            period_id = reset_dt.strftime("%Y-%W")   # year + week number
+            if getattr(self, "_warned_period", None) != period_id:
+                self._warned_at     = set()
+                self._warned_period = period_id
+        except Exception:
+            pass
+
+        for threshold in WARN_THRESHOLDS:
+            if wpct >= threshold and threshold not in self._warned_at:
+                self._warned_at.add(threshold)
+                wr = _fmt_reset(wreset)
+                if threshold == 100:
+                    rumps.notification(
+                        "ClaudeWatch — Limit Reached",
+                        "Weekly usage at 100%",
+                        f"Resets in {wr}." if wr else "You've hit your weekly limit.",
+                    )
+                else:
+                    rumps.notification(
+                        f"ClaudeWatch — {threshold}% Weekly Usage",
+                        f"You've used {wpct:.0f}% of your weekly limit",
+                        f"Resets in {wr}. Consider switching to Haiku for lighter tasks."
+                        if wr else "Consider switching to Haiku for lighter tasks.",
+                    )
 
     def _apply_ui(self, usage, error=None):
         session_header = "⬤  Session (5h)"
@@ -851,9 +892,10 @@ class ClaudeMonitorApp(rumps.App):
         eu = usage.get("extra_used")
         el = usage.get("extra_limit")
         if eu is not None and el:
+            extra_str = f"${eu/CREDITS_PER_DOLLAR:.2f} / ${el/CREDITS_PER_DOLLAR:.2f}"
             self.menu[weekly_detail].title = (
-                f"   resets in {wreset}  ·  extra {eu:.0f}/{el:.0f} cr"
-                if wreset else f"   extra {eu:.0f}/{el:.0f} cr"
+                f"   resets in {wreset}  ·  extra {extra_str}"
+                if wreset else f"   extra {extra_str}"
             )
         elif wreset:
             self.menu[weekly_detail].title = f"   resets in {wreset}"

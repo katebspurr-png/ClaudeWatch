@@ -14,7 +14,6 @@ Run:
 
 import rumps
 import webbrowser
-import os
 import json
 import threading
 import hashlib
@@ -35,18 +34,22 @@ except ImportError:
 CONFIG_DIR = Path.home() / ".claude_monitor"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 COOKIES_DB = Path.home() / "Library/Application Support/Claude/Cookies"
+ICON_PATH = str(CONFIG_DIR / "TrayIconTemplate.png")
 
 CLAUDE_USAGE_URL = "https://claude.ai/settings/usage"
 
 DEFAULT_CONFIG = {
     "refresh_interval_minutes": 5,
+    "show_session_pct": True,
+    "show_weekly_pct": True,
+    "show_reset_time": False,
+    "show_hover_tooltip": True,
 }
 
 
 # ─── Cookie decryption ───────────────────────────────────────────────────────
 
 def _get_aes_key():
-    """Derive the AES key from the Keychain-stored password (Chromium v10 format)."""
     result = subprocess.run(
         ["security", "find-generic-password",
          "-s", "Claude Safe Storage", "-a", "Claude Key", "-w"],
@@ -59,35 +62,19 @@ def _get_aes_key():
 
 
 def _decrypt_cookie(encrypted_value, key):
-    """
-    Decrypt a Chromium v10 AES-CBC cookie.
-
-    Format: b"v10" + ciphertext
-    The plaintext layout is: [32-byte Chromium header][cookie value][PKCS7 padding]
-    IV is always 16 space chars (Chromium default on macOS).
-    """
     if not encrypted_value.startswith(b"v10"):
         return encrypted_value.decode("utf-8", errors="replace")
     ciphertext = encrypted_value[3:]
     cipher = AES.new(key, AES.MODE_CBC, b" " * 16)
     decrypted = cipher.decrypt(ciphertext)
     pad_len = decrypted[-1]
-    # Skip the 32-byte Chromium internal header prepended before encryption
     return decrypted[32:-pad_len].decode("utf-8")
 
 
 def get_claude_cookies():
-    """
-    Read and decrypt cookies from the Claude desktop app's Chromium cookie store.
-    Returns a dict of {name: value} for claude.ai cookies.
-    Raises if the cookies DB or keychain entry can't be accessed.
-    """
     if not COOKIES_DB.exists():
         raise FileNotFoundError(f"Claude cookies DB not found: {COOKIES_DB}")
-
     key = _get_aes_key()
-
-    # Copy the DB path to avoid locking issues with the live Claude app
     conn = sqlite3.connect(str(COOKIES_DB))
     try:
         rows = conn.execute(
@@ -95,37 +82,21 @@ def get_claude_cookies():
         ).fetchall()
     finally:
         conn.close()
-
     return {name: _decrypt_cookie(val, key) for name, val in rows}
 
 
 # ─── Usage API ───────────────────────────────────────────────────────────────
 
 def fetch_claude_usage():
-    """
-    Fetch Claude.ai usage data using the desktop app's session cookies.
-
-    Returns a dict:
-        {
-            "session_pct":  float,   # 5-hour window utilisation %
-            "weekly_pct":   float,   # 7-day window utilisation %
-            "session_resets_at": str,
-            "weekly_resets_at":  str,
-            "extra_used":   float | None,
-            "extra_limit":  float | None,
-        }
-    or raises on error.
-    """
     cookies = get_claude_cookies()
-
     org_id = cookies.get("lastActiveOrg", "")
     if not org_id:
         raise RuntimeError("Could not determine org ID from cookies")
 
     session = requests.Session()
     session.cookies.update({
-        "sessionKey":         cookies.get("sessionKey", ""),
-        "lastActiveOrg":      org_id,
+        "sessionKey":          cookies.get("sessionKey", ""),
+        "lastActiveOrg":       org_id,
         "anthropic-device-id": cookies.get("anthropic-device-id", ""),
     })
     session.headers.update({
@@ -135,8 +106,9 @@ def fetch_claude_usage():
         "Referer": "https://claude.ai/",
     })
 
-    url = f"https://claude.ai/api/organizations/{org_id}/usage"
-    resp = session.get(url, timeout=15)
+    resp = session.get(
+        f"https://claude.ai/api/organizations/{org_id}/usage", timeout=15
+    )
     resp.raise_for_status()
     data = resp.json()
 
@@ -172,43 +144,90 @@ def save_config(config):
 
 
 def _fmt_reset(iso_str):
-    """Format an ISO timestamp as a human-friendly relative string."""
     if not iso_str:
         return ""
     try:
         dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-        now = datetime.now(timezone.utc)
-        delta = dt - now
-        mins = int(delta.total_seconds() / 60)
+        mins = int((dt - datetime.now(timezone.utc)).total_seconds() / 60)
         if mins <= 0:
             return "now"
         if mins < 60:
             return f"{mins}m"
-        return f"{mins // 60}h {mins % 60:02d}m"
+        h, m = divmod(mins, 60)
+        if h < 24:
+            return f"{h}h {m:02d}m"
+        d, h = divmod(h, 24)
+        return f"{d}d {h}h"
     except Exception:
         return ""
 
 
+def _build_title(usage, config):
+    if usage is None:
+        return "!"
+    parts = []
+    if config.get("show_session_pct"):
+        parts.append(f"{usage['session_pct']:.0f}%")
+    if config.get("show_weekly_pct"):
+        parts.append(f"{usage['weekly_pct']:.0f}%")
+    title = " | ".join(parts) if parts else "◈"
+    if config.get("show_reset_time"):
+        reset = _fmt_reset(usage.get("session_resets_at", ""))
+        if reset:
+            title += f"  ↺{reset}"
+    return title
+
+
+def _build_tooltip(usage):
+    if usage is None:
+        return "ClaudeWatch — no data"
+    spct  = usage.get("session_pct", 0)
+    wpct  = usage.get("weekly_pct", 0)
+    sr    = _fmt_reset(usage.get("session_resets_at", ""))
+    wr    = _fmt_reset(usage.get("weekly_resets_at", ""))
+    lines = [
+        "ClaudeWatch",
+        f"Session (5h):  {spct:.0f}%" + (f"  —  resets in {sr}" if sr else ""),
+        f"Weekly  (7d):  {wpct:.0f}%" + (f"  —  resets in {wr}" if wr else ""),
+    ]
+    eu = usage.get("extra_used")
+    el = usage.get("extra_limit")
+    if eu is not None and el:
+        lines.append(f"Extra credits: {eu:.0f} / {el:.0f}")
+    return "\n".join(lines)
+
+
 # ─── Menu Bar App ────────────────────────────────────────────────────────────
-
-ICON_PATH = str(CONFIG_DIR / "TrayIconTemplate.png")
-
 
 class ClaudeMonitorApp(rumps.App):
     def __init__(self):
-        title = "missing deps" if not DEPS_OK else "…"
-
         super().__init__(
             "Claude",
-            title=title,
+            title="…" if DEPS_OK else "missing deps",
             icon=ICON_PATH,
-            template=True,   # adapts to light/dark menu bar
+            template=True,
             quit_button=None,
         )
 
         self.config = load_config()
         self._usage = None
-        self._timer = None
+
+        # Settings — toggleable checkmark items
+        self._s_session = rumps.MenuItem("Session % (5h)", callback=self._toggle("show_session_pct"))
+        self._s_weekly  = rumps.MenuItem("Weekly % (7d)",  callback=self._toggle("show_weekly_pct"))
+        self._s_reset   = rumps.MenuItem("Reset time",     callback=self._toggle("show_reset_time"))
+        self._s_tooltip = rumps.MenuItem("Hover tooltip",  callback=self._toggle("show_hover_tooltip"))
+        self._sync_checkmarks()
+
+        settings = rumps.MenuItem("Settings")
+        settings.update([
+            rumps.MenuItem("Show in menu bar:", callback=None),
+            self._s_session,
+            self._s_weekly,
+            self._s_reset,
+            None,
+            self._s_tooltip,
+        ])
 
         self.menu = [
             rumps.MenuItem("Open Claude Usage", callback=self.open_usage),
@@ -218,16 +237,43 @@ class ClaudeMonitorApp(rumps.App):
             rumps.MenuItem("⬤  Weekly (7d)", callback=None),
             rumps.MenuItem("   —  ", callback=None),
             None,
+            settings,
             rumps.MenuItem("Refresh Now", callback=self.manual_refresh),
             None,
             rumps.MenuItem("Quit", callback=self.quit_app),
         ]
 
-        if not DEPS_OK:
-            self.menu["   —"].title = "   Install: pip install requests pycryptodome"
-        else:
+        if DEPS_OK:
             self._start_timer()
             threading.Thread(target=self._refresh, daemon=True).start()
+
+    # ── Settings toggles ──
+
+    def _toggle(self, key):
+        """Return a callback that flips a boolean config key and refreshes the UI."""
+        def callback(_):
+            self.config[key] = not self.config.get(key, True)
+            save_config(self.config)
+            self._sync_checkmarks()
+            if self._usage:
+                self._apply_ui(self._usage)
+        return callback
+
+    def _sync_checkmarks(self):
+        self._s_session.state = int(bool(self.config.get("show_session_pct", True)))
+        self._s_weekly.state  = int(bool(self.config.get("show_weekly_pct",  True)))
+        self._s_reset.state   = int(bool(self.config.get("show_reset_time",  False)))
+        self._s_tooltip.state = int(bool(self.config.get("show_hover_tooltip", True)))
+
+    # ── Tooltip ──
+
+    def _set_tooltip(self, text):
+        try:
+            self._status_item.setToolTip_(text)
+        except Exception:
+            pass
+
+    # ── Menu actions ──
 
     @rumps.clicked("Open Claude Usage")
     def open_usage(self, _):
@@ -241,6 +287,8 @@ class ClaudeMonitorApp(rumps.App):
     def quit_app(self, _):
         rumps.quit_application()
 
+    # ── Refresh ──
+
     def _start_timer(self):
         interval = self.config.get("refresh_interval_minutes", 5) * 60
 
@@ -252,11 +300,11 @@ class ClaudeMonitorApp(rumps.App):
         try:
             usage = fetch_claude_usage()
             self._usage = usage
-            self._update_ui(usage, error=None)
+            self._apply_ui(usage)
         except Exception as e:
-            self._update_ui(None, error=str(e))
+            self._apply_ui(None, error=str(e))
 
-    def _update_ui(self, usage, error):
+    def _apply_ui(self, usage, error=None):
         session_header = "⬤  Session (5h)"
         session_detail = "   —"
         weekly_header  = "⬤  Weekly (7d)"
@@ -265,31 +313,34 @@ class ClaudeMonitorApp(rumps.App):
         if error:
             self.title = "!"
             self.menu[session_detail].title = f"   {error[:60]}"
+            self._set_tooltip(f"ClaudeWatch — error\n{error[:120]}")
             return
 
-        spct = usage["session_pct"]
-        wpct = usage["weekly_pct"]
+        # Menu bar title
+        self.title = _build_title(usage, self.config)
 
-        # Menu bar title: show both percentages (icon is shown separately)
-        self.title = f"{spct:.0f}% | {wpct:.0f}%"
+        # Hover tooltip
+        if self.config.get("show_hover_tooltip", True):
+            self._set_tooltip(_build_tooltip(usage))
+        else:
+            self._set_tooltip("")
 
+        # Menu items
+        spct   = usage["session_pct"]
+        wpct   = usage["weekly_pct"]
         sreset = _fmt_reset(usage["session_resets_at"])
         wreset = _fmt_reset(usage["weekly_resets_at"])
 
         self.menu[session_header].title = f"⬤  Session (5h) — {spct:.1f}%"
-        self.menu[session_detail].title = (
-            f"   resets in {sreset}" if sreset else "   —"
-        )
-
+        self.menu[session_detail].title = f"   resets in {sreset}" if sreset else "   —"
         self.menu[weekly_header].title  = f"⬤  Weekly (7d) — {wpct:.1f}%"
 
-        extra_used  = usage.get("extra_used")
-        extra_limit = usage.get("extra_limit")
-        if extra_used is not None and extra_limit:
+        eu = usage.get("extra_used")
+        el = usage.get("extra_limit")
+        if eu is not None and el:
             self.menu[weekly_detail].title = (
-                f"   resets in {wreset}  ·  extra {extra_used:.0f}/{extra_limit:.0f} cr"
-                if wreset else
-                f"   extra {extra_used:.0f}/{extra_limit:.0f} cr"
+                f"   resets in {wreset}  ·  extra {eu:.0f}/{el:.0f} cr"
+                if wreset else f"   extra {eu:.0f}/{el:.0f} cr"
             )
         elif wreset:
             self.menu[weekly_detail].title = f"   resets in {wreset}"

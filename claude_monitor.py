@@ -180,6 +180,42 @@ def load_history(days=14):
 
 # ─── Analytics ───────────────────────────────────────────────────────────────
 
+DOW_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+DOW_SHORT = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+def calc_day_patterns(rows):
+    """
+    Calculate average % burned per day of week from all history.
+    Returns {0: avg_mon, 1: avg_tue, ...} or None if < 7 unique days available.
+    """
+    from collections import defaultdict
+
+    date_increments = defaultdict(float)
+    prev_pct = None
+
+    for row in rows:
+        ts, _, w_pct = row[0], row[1], row[2]
+        try:
+            local_date = datetime.fromisoformat(ts).astimezone().date()
+        except Exception:
+            continue
+        if prev_pct is not None:
+            inc = w_pct - prev_pct
+            if 0 < inc < 20:          # plausible positive increment, skip resets
+                date_increments[local_date] += inc
+        prev_pct = w_pct
+
+    if len(date_increments) < 7:
+        return None                   # need at least one full week
+
+    dow_groups = defaultdict(list)
+    for date, inc in date_increments.items():
+        dow_groups[date.weekday()].append(inc)
+
+    return {dow: sum(vals) / len(vals) for dow, vals in dow_groups.items()}
+
+
 def calculate_stats(usage, rows):
     """
     Derive burn rate, projection, and daily budget from history.
@@ -245,6 +281,8 @@ def calculate_stats(usage, rows):
     chart_labels = sorted(buckets)
     chart_values = [buckets[k] for k in chart_labels]
 
+    day_patterns = calc_day_patterns(rows)
+
     return {
         "burn_per_hour":    burn_per_hour,
         "burn_per_day":     burn_per_day,
@@ -255,14 +293,31 @@ def calculate_stats(usage, rows):
         "chart_labels":     chart_labels,
         "chart_values":     chart_values,
         "readings_count":   len(period_rows),
+        "day_patterns":     day_patterns,
     }
 
 
 def _tip(usage, stats):
-    wpct = usage["weekly_pct"]
-    spct = usage["session_pct"]
+    wpct     = usage["weekly_pct"]
+    spct     = usage["session_pct"]
+    today    = datetime.now().weekday()
+
     if stats is None:
         return "Keep using Claude and your dashboard will fill in over the next few hours."
+
+    patterns = stats.get("day_patterns") or {}
+
+    # Pattern-aware tip: warn if today is historically heavy
+    if patterns and today in patterns and len(patterns) >= 5:
+        heaviest = max(patterns, key=patterns.get)
+        today_avg = patterns[today]
+        overall_avg = sum(patterns.values()) / len(patterns)
+        if today == heaviest and today_avg > overall_avg * 1.3:
+            day_name = DOW_NAMES[today]
+            return (f"Heads up — {day_name} is historically your heaviest usage day "
+                    f"(avg {today_avg:.1f}% burned). Consider saving complex tasks for later "
+                    f"in the week if you're running low.")
+
     if stats["hits_limit"]:
         days = stats["days_until_reset"]
         return (f"⚠️ At this burn rate you'll hit your weekly limit before the reset "
@@ -275,6 +330,15 @@ def _tip(usage, stats):
         return "You're burning faster than your daily budget. Consider batching smaller questions into single prompts to save credits."
     if wpct < 30 and stats["days_until_reset"] < 2:
         return "You have plenty of credits with only a couple of days until reset — great time to tackle that complex project with Opus."
+
+    # Lightest day coming up?
+    if patterns and len(patterns) >= 5:
+        lightest = min(patterns, key=patterns.get)
+        days_ahead = (lightest - today) % 7
+        if 1 <= days_ahead <= 3:
+            return (f"{DOW_NAMES[lightest]} is typically your lightest day "
+                    f"— good time to save heavier Opus work for then.")
+
     return "You're on track. Keep using the right model for the job: Haiku for quick tasks, Sonnet for most work, Opus for deep reasoning."
 
 
@@ -361,6 +425,55 @@ def generate_dashboard(usage, stats):
         reset_str  = f"{stats['days_until_reset']:.1f} days"
     else:
         burn_str = budget_str = reset_str = "—"
+
+    # Day-of-week pattern chart
+    patterns = stats.get("day_patterns") if stats else None
+    if patterns and len(patterns) >= 5:
+        today = datetime.now().weekday()
+        dow_labels = json.dumps([DOW_SHORT[i] for i in range(7)])
+        dow_values = json.dumps([round(patterns.get(i, 0), 2) for i in range(7)])
+        dow_colors = json.dumps([
+            "#D97757" if i == max(patterns, key=patterns.get)
+            else "#93c5fd" if i == today
+            else "#e5e7eb"
+            for i in range(7)
+        ])
+        heaviest_day = DOW_NAMES[max(patterns, key=patterns.get)]
+        pattern_html = f"""
+        <div class="card">
+          <h2>Usage by Day of Week <span style="font-weight:400;color:var(--muted)">(avg % burned)</span></h2>
+          <canvas id="dowchart" height="80"></canvas>
+          <p style="font-size:.8rem;color:var(--muted);margin-top:12px">
+            Heaviest day: <b>{heaviest_day}</b> &nbsp;·&nbsp; Blue bar = today
+          </p>
+        </div>
+        <script>
+        new Chart(document.getElementById('dowchart'), {{
+          type: 'bar',
+          data: {{
+            labels: {dow_labels},
+            datasets: [{{
+              data: {dow_values},
+              backgroundColor: {dow_colors},
+              borderRadius: 6,
+            }}]
+          }},
+          options: {{
+            plugins: {{ legend: {{ display: false }} }},
+            scales: {{
+              y: {{ min: 0, ticks: {{ callback: v => v + '%' }} }},
+              x: {{ grid: {{ display: false }} }}
+            }}
+          }}
+        }});
+        </script>"""
+    else:
+        days_needed = 7 - (len(patterns) if patterns else 0)
+        pattern_html = f"""
+        <div class="card muted">
+          <h2>Usage by Day of Week</h2>
+          <p>Pattern chart appears after {days_needed} more day{"s" if days_needed != 1 else ""} of data.</p>
+        </div>"""
 
     extra_html = ""
     if eu is not None and el:
@@ -468,6 +581,7 @@ def generate_dashboard(usage, stats):
 
 {extra_html}
 {chart_html}
+{pattern_html}
 
 <div class="footer">ClaudeWatch · data from Claude desktop app · <a href="{CLAUDE_USAGE_URL}" style="color:var(--accent)">open claude.ai</a></div>
 </body>
@@ -584,6 +698,40 @@ class ClaudeMonitorApp(rumps.App):
             self._s_tooltip,
         ])
 
+        # Model guide submenu
+        def _info(label):
+            return rumps.MenuItem(label, callback=None)
+
+        haiku = rumps.MenuItem("Haiku — fast & cheap")
+        haiku.update([
+            _info("  • Quick Q&A and lookups"),
+            _info("  • Summarisation"),
+            _info("  • Translation"),
+            _info("  • Simple edits & rewrites"),
+            _info("  • High-volume / repetitive tasks"),
+        ])
+
+        sonnet = rumps.MenuItem("Sonnet — best for most tasks  ★")
+        sonnet.update([
+            _info("  • Coding & debugging"),
+            _info("  • Writing & long-form editing"),
+            _info("  • Data analysis & research"),
+            _info("  • Complex instructions"),
+            _info("  • Most everyday tasks"),
+        ])
+
+        opus = rumps.MenuItem("Opus — deep reasoning")
+        opus.update([
+            _info("  • Hard math & logic"),
+            _info("  • Multi-step planning"),
+            _info("  • Novel / open-ended problems"),
+            _info("  • Architecture & system design"),
+            _info("  • When Sonnet isn't cutting it"),
+        ])
+
+        model_guide = rumps.MenuItem("Model Guide")
+        model_guide.update([haiku, sonnet, opus])
+
         self.menu = [
             rumps.MenuItem("Open Claude Usage",  callback=self.open_usage),
             rumps.MenuItem("View Dashboard",     callback=self.open_dashboard),
@@ -593,6 +741,7 @@ class ClaudeMonitorApp(rumps.App):
             rumps.MenuItem("⬤  Weekly (7d)",    callback=None),
             rumps.MenuItem("   —  ",             callback=None),
             None,
+            model_guide,
             settings,
             rumps.MenuItem("Refresh Now",        callback=self.manual_refresh),
             None,

@@ -781,7 +781,7 @@ class ClaudeMonitorApp(rumps.App):
 
     def _set_tooltip(self, text):
         try:
-            self._status_item.setToolTip_(text)
+            self._nsapp.nsstatusitem.setToolTip_(text)
         except Exception:
             pass
 

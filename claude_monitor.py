@@ -28,10 +28,42 @@ CONFIG_DIR  = Path.home() / ".claude_monitor"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 DB_PATH     = CONFIG_DIR / "history.db"
 DASH_PATH   = CONFIG_DIR / "dashboard.html"
-COOKIES_DB  = Path.home() / "Library/Application Support/Claude/Cookies"
 ICON_PATH   = str(CONFIG_DIR / "TrayIconTemplate.png")
+SESSION_KEY_FILE = CONFIG_DIR / "session_key"
 
 CLAUDE_USAGE_URL = "https://claude.ai/settings/usage"
+
+# ─── Auth Sources ────────────────────────────────────────────────────────────
+
+AUTH_SOURCES = {
+    "claude_desktop": {
+        "label":        "Claude Desktop App",
+        "cookies_db":   Path.home() / "Library/Application Support/Claude/Cookies",
+        "keychain_svc": "Claude Safe Storage",
+        "keychain_acct":"Claude Key",
+    },
+    "chrome": {
+        "label":        "Google Chrome",
+        "cookies_db":   Path.home() / "Library/Application Support/Google/Chrome/Default/Cookies",
+        "keychain_svc": "Chrome Safe Storage",
+        "keychain_acct":"Chrome",
+    },
+    "brave": {
+        "label":        "Brave Browser",
+        "cookies_db":   Path.home() / "Library/Application Support/BraveSoftware/Brave-Browser/Default/Cookies",
+        "keychain_svc": "Brave Safe Storage",
+        "keychain_acct":"Brave",
+    },
+    "edge": {
+        "label":        "Microsoft Edge",
+        "cookies_db":   Path.home() / "Library/Application Support/Microsoft Edge/Default/Cookies",
+        "keychain_svc": "Microsoft Edge Safe Storage",
+        "keychain_acct":"Microsoft Edge",
+    },
+    "manual": {
+        "label":        "Manual Session Key",
+    },
+}
 
 DEFAULT_CONFIG = {
     "refresh_interval_minutes": 5,
@@ -39,23 +71,24 @@ DEFAULT_CONFIG = {
     "show_weekly_pct":    True,
     "show_reset_time":    False,
     "show_hover_tooltip": True,
+    "auth_source":        "auto",   # "auto", "claude_desktop", "chrome", "brave", "edge", "manual"
 }
 
 CREDITS_PER_DOLLAR = 100   # 1 credit = $0.01 (confirmed against billing)
 WARN_THRESHOLDS    = [80, 90, 100]  # % weekly usage to notify at
 
 
-# ─── Cookie decryption ───────────────────────────────────────────────────────
+# ─── Cookie decryption (multi-source) ────────────────────────────────────────
 
-def _get_aes_key():
+def _get_aes_key(service, account):
     result = subprocess.run(
         ["security", "find-generic-password",
-         "-s", "Claude Safe Storage", "-a", "Claude Key", "-w"],
+         "-s", service, "-a", account, "-w"],
         capture_output=True, text=True,
     )
     password = result.stdout.strip()
     if not password:
-        raise RuntimeError("Could not read 'Claude Safe Storage' from Keychain")
+        raise RuntimeError(f"Could not read '{service}' from Keychain")
     return hashlib.pbkdf2_hmac("sha1", password.encode(), b"saltysalt", 1003, dklen=16)
 
 
@@ -69,42 +102,118 @@ def _decrypt_cookie(encrypted_value, key):
     return decrypted[32:-pad_len].decode("utf-8")
 
 
-def get_claude_cookies():
-    if not COOKIES_DB.exists():
-        raise FileNotFoundError(f"Claude cookies DB not found: {COOKIES_DB}")
-    key = _get_aes_key()
-    conn = sqlite3.connect(str(COOKIES_DB))
+def _read_chromium_cookies(source_cfg):
+    db_path = source_cfg["cookies_db"]
+    if not db_path.exists():
+        raise FileNotFoundError(f"Cookie DB not found: {db_path}")
+    key = _get_aes_key(source_cfg["keychain_svc"], source_cfg["keychain_acct"])
+    conn = sqlite3.connect(str(db_path))
     try:
         rows = conn.execute(
             "SELECT name, encrypted_value FROM cookies WHERE host_key LIKE '%claude.ai%'"
         ).fetchall()
     finally:
         conn.close()
+    if not rows:
+        raise RuntimeError(f"No claude.ai cookies found in {source_cfg['label']}")
     return {name: _decrypt_cookie(val, key) for name, val in rows}
+
+
+def _read_manual_session_key():
+    if SESSION_KEY_FILE.exists():
+        key = SESSION_KEY_FILE.read_text().strip()
+        if key:
+            return key
+    return None
+
+
+def _detect_available_sources():
+    available = []
+    for name, cfg in AUTH_SOURCES.items():
+        if name == "manual":
+            if _read_manual_session_key():
+                available.append(name)
+            continue
+        db_path = cfg.get("cookies_db")
+        if db_path and db_path.exists():
+            available.append(name)
+    return available
+
+
+def get_claude_cookies(config):
+    auth_pref = config.get("auth_source", "auto")
+
+    # Manual session key — return minimal cookie dict
+    if auth_pref == "manual":
+        key = _read_manual_session_key()
+        if not key:
+            raise RuntimeError("No manual session key configured. Use 'Set Session Key' in the menu.")
+        return {"sessionKey": key, "_source": "manual"}
+
+    # Specific source
+    if auth_pref != "auto" and auth_pref in AUTH_SOURCES and auth_pref != "manual":
+        return {**_read_chromium_cookies(AUTH_SOURCES[auth_pref]), "_source": auth_pref}
+
+    # Auto-detect: try each Chromium source in order
+    errors = []
+    for name in ["claude_desktop", "chrome", "brave", "edge"]:
+        try:
+            cookies = _read_chromium_cookies(AUTH_SOURCES[name])
+            if cookies.get("sessionKey"):
+                return {**cookies, "_source": name}
+        except Exception as e:
+            errors.append(f"{AUTH_SOURCES[name]['label']}: {e}")
+
+    # Fall back to manual key
+    key = _read_manual_session_key()
+    if key:
+        return {"sessionKey": key, "_source": "manual"}
+
+    raise RuntimeError(
+        "Could not find Claude cookies in any source.\n"
+        + "\n".join(errors)
+        + "\nUse 'Set Session Key' in the menu to paste one manually."
+    )
 
 
 # ─── Usage API ───────────────────────────────────────────────────────────────
 
-def fetch_claude_usage():
-    cookies = get_claude_cookies()
-    org_id  = cookies.get("lastActiveOrg", "")
-    if not org_id:
-        raise RuntimeError("Could not determine org ID from cookies")
+def fetch_claude_usage(config):
+    cookies = get_claude_cookies(config)
+    source  = cookies.pop("_source", "unknown")
 
-    session = requests.Session()
-    session.cookies.update({
-        "sessionKey":          cookies.get("sessionKey", ""),
+    session_key = cookies.get("sessionKey", "")
+    if not session_key:
+        raise RuntimeError("No sessionKey found — try a different auth source")
+
+    org_id = cookies.get("lastActiveOrg", "")
+
+    http = requests.Session()
+    http.cookies.update({
+        "sessionKey":          session_key,
         "lastActiveOrg":       org_id,
         "anthropic-device-id": cookies.get("anthropic-device-id", ""),
     })
-    session.headers.update({
+    http.headers.update({
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                       "AppleWebKit/537.36 (KHTML, like Gecko) Claude/1.0",
         "Accept":   "application/json",
         "Referer":  "https://claude.ai/",
     })
 
-    resp = session.get(
+    # If we don't have an org ID (manual key), fetch it from the API
+    if not org_id:
+        resp = http.get("https://claude.ai/api/organizations", timeout=15)
+        resp.raise_for_status()
+        orgs = resp.json()
+        if not orgs:
+            raise RuntimeError("No organizations found for this account")
+        org_id = orgs[0].get("uuid", "")
+        if not org_id:
+            raise RuntimeError("Could not determine org ID")
+        http.cookies.set("lastActiveOrg", org_id)
+
+    resp = http.get(
         f"https://claude.ai/api/organizations/{org_id}/usage", timeout=15
     )
     resp.raise_for_status()
@@ -121,6 +230,7 @@ def fetch_claude_usage():
         "weekly_resets_at":  seven_day.get("resets_at",  ""),
         "extra_used":        extra.get("used_credits"),
         "extra_limit":       extra.get("monthly_limit"),
+        "_auth_source":      source,
     }
 
 
@@ -590,7 +700,7 @@ def generate_dashboard(usage, stats):
 {chart_html}
 {pattern_html}
 
-<div class="footer">ClaudeWatch · data from Claude desktop app · <a href="{CLAUDE_USAGE_URL}" style="color:var(--accent)">open claude.ai</a></div>
+<div class="footer">ClaudeWatch · <a href="{CLAUDE_USAGE_URL}" style="color:var(--accent)">open claude.ai</a></div>
 </body>
 </html>"""
 
@@ -689,12 +799,27 @@ class ClaudeMonitorApp(rumps.App):
         if DEPS_OK:
             init_db()
 
+        self._auth_source_label = ""  # filled after first fetch
+
         # Settings checkmark items
         self._s_session = rumps.MenuItem("Session % (5h)", callback=self._toggle("show_session_pct"))
         self._s_weekly  = rumps.MenuItem("Weekly % (7d)",  callback=self._toggle("show_weekly_pct"))
         self._s_reset   = rumps.MenuItem("Reset time",     callback=self._toggle("show_reset_time"))
         self._s_tooltip = rumps.MenuItem("Hover tooltip",  callback=self._toggle("show_hover_tooltip"))
         self._sync_checkmarks()
+
+        # Auth source radio items
+        self._auth_items = {}
+        auth_menu = rumps.MenuItem("Auth Source")
+        self._auth_items["auto"] = rumps.MenuItem(
+            "Auto-detect (recommended)", callback=self._set_auth("auto"))
+        auth_menu.add(self._auth_items["auto"])
+        auth_menu.add(None)
+        for src_name, src_cfg in AUTH_SOURCES.items():
+            item = rumps.MenuItem(src_cfg["label"], callback=self._set_auth(src_name))
+            self._auth_items[src_name] = item
+            auth_menu.add(item)
+        self._sync_auth_checkmarks()
 
         settings = rumps.MenuItem("Settings")
         settings.update([
@@ -704,6 +829,8 @@ class ClaudeMonitorApp(rumps.App):
             self._s_reset,
             None,
             self._s_tooltip,
+            None,
+            auth_menu,
         ])
 
         # Model guide submenu
@@ -748,9 +875,11 @@ class ClaudeMonitorApp(rumps.App):
             rumps.MenuItem("   —",               callback=None),
             rumps.MenuItem("⬤  Weekly (7d)",    callback=None),
             rumps.MenuItem("   —  ",             callback=None),
+            rumps.MenuItem("   Source: detecting…", callback=None),
             None,
             model_guide,
             settings,
+            rumps.MenuItem("Set Session Key…",   callback=self.paste_session_key),
             rumps.MenuItem("Refresh Now",        callback=self.manual_refresh),
             None,
             rumps.MenuItem("Quit",               callback=self.quit_app),
@@ -777,6 +906,19 @@ class ClaudeMonitorApp(rumps.App):
         self._s_reset.state   = int(bool(self.config.get("show_reset_time",    False)))
         self._s_tooltip.state = int(bool(self.config.get("show_hover_tooltip", True)))
 
+    def _set_auth(self, source_name):
+        def callback(_):
+            self.config["auth_source"] = source_name
+            save_config(self.config)
+            self._sync_auth_checkmarks()
+            threading.Thread(target=self._refresh, daemon=True).start()
+        return callback
+
+    def _sync_auth_checkmarks(self):
+        current = self.config.get("auth_source", "auto")
+        for name, item in self._auth_items.items():
+            item.state = int(name == current)
+
     # ── Tooltip ──
 
     def _set_tooltip(self, text):
@@ -800,6 +942,32 @@ class ClaudeMonitorApp(rumps.App):
             rumps.notification("ClaudeWatch", "No data yet", "Fetching usage now…")
             threading.Thread(target=self._refresh, daemon=True).start()
 
+    @rumps.clicked("Set Session Key…")
+    def paste_session_key(self, _):
+        w = rumps.Window(
+            message=(
+                "Paste your sessionKey cookie value.\n\n"
+                "To find it:\n"
+                "1. Open claude.ai in your browser\n"
+                "2. Open DevTools (Cmd+Option+I)\n"
+                "3. Go to Application → Cookies → claude.ai\n"
+                "4. Copy the 'sessionKey' value"
+            ),
+            title="ClaudeWatch — Set Session Key",
+            default_text="",
+            ok="Save",
+            cancel="Cancel",
+            dimensions=(380, 100),
+        )
+        resp = w.run()
+        if resp.clicked and resp.text.strip():
+            SESSION_KEY_FILE.write_text(resp.text.strip())
+            self.config["auth_source"] = "manual"
+            save_config(self.config)
+            self._sync_auth_checkmarks()
+            rumps.notification("ClaudeWatch", "Session key saved", "Refreshing now…")
+            threading.Thread(target=self._refresh, daemon=True).start()
+
     @rumps.clicked("Refresh Now")
     def manual_refresh(self, _):
         threading.Thread(target=self._refresh, daemon=True).start()
@@ -819,7 +987,10 @@ class ClaudeMonitorApp(rumps.App):
 
     def _refresh(self):
         try:
-            usage        = fetch_claude_usage()
+            usage        = fetch_claude_usage(self.config)
+            source_name  = usage.pop("_auth_source", "unknown")
+            src_cfg      = AUTH_SOURCES.get(source_name, {})
+            self._auth_source_label = src_cfg.get("label", source_name)
             self._usage  = usage
             log_usage(usage)
             rows         = load_history()
@@ -866,12 +1037,16 @@ class ClaudeMonitorApp(rumps.App):
         session_detail = "   —"
         weekly_header  = "⬤  Weekly (7d)"
         weekly_detail  = "   —  "
+        source_item    = "   Source: detecting…"
 
         if error:
             self.title = "!"
             self.menu[session_detail].title = f"   {error[:60]}"
+            self.menu[source_item].title = "   Source: error"
             self._set_tooltip(f"ClaudeWatch — error\n{error[:120]}")
             return
+
+        self.menu[source_item].title = f"   Source: {self._auth_source_label}"
 
         self.title = _build_title(usage, self.config)
 

@@ -809,6 +809,176 @@ def _conversations_dashboard_html(conversations):
 
 # ─── Dashboard HTML ──────────────────────────────────────────────────────────
 
+# Rough cost weights per model (relative to Sonnet = 1.0)
+MODEL_COST_WEIGHT = {
+    "claude-sonnet-4-6": 1.0,
+    "claude-sonnet-4-5": 1.0,
+    "claude-haiku-4-5":  0.15,
+    "claude-opus-4-6":   5.0,
+    "claude-opus-4-5":   5.0,
+}
+
+
+def _conversation_insights_html(conversations):
+    """Rank conversations by estimated cost and show insights."""
+    if not conversations or len(conversations) < 2:
+        return ""
+
+    # Estimate relative cost from model and recency (more recent = more active = higher cost)
+    ranked = []
+    now = datetime.now(timezone.utc)
+    for c in conversations[:20]:
+        model_id = c.get("model") or ""
+        weight = MODEL_COST_WEIGHT.get(model_id, 1.0)
+        name = c.get("name") or "Untitled"
+        uuid = c.get("uuid", "")
+        updated = c.get("updated_at", "")
+        model_label = MODEL_DISPLAY.get(model_id, model_id.split("-")[-1].title() if model_id else "?")
+
+        # Estimate "size" from created_at vs updated_at span
+        created = c.get("created_at", updated)
+        try:
+            created_dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            updated_dt = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+            duration_hrs = max((updated_dt - created_dt).total_seconds() / 3600, 0.1)
+        except Exception:
+            duration_hrs = 1.0
+
+        # Longer conversations on heavier models = more expensive
+        # This is a rough heuristic but directionally useful
+        estimated_cost = weight * min(duration_hrs, 24)  # cap at 24h
+
+        if len(name) > 45:
+            name = name[:42] + "..."
+
+        ranked.append({
+            "name": name,
+            "uuid": uuid,
+            "model": model_label,
+            "weight": weight,
+            "duration_hrs": duration_hrs,
+            "cost": estimated_cost,
+        })
+
+    ranked.sort(key=lambda x: x["cost"], reverse=True)
+    max_cost = ranked[0]["cost"] if ranked else 1
+
+    rows = ""
+    for i, c in enumerate(ranked[:8]):
+        bar_width = c["cost"] / max_cost * 100
+        bar_color = "#ef4444" if c["weight"] >= 5 else "#f59e0b" if c["weight"] >= 1 else "#22c55e"
+        link = f"https://claude.ai/chat/{c['uuid']}" if c["uuid"] else "#"
+        label = "Heavy" if c["weight"] >= 5 else "Medium" if c["weight"] >= 1 else "Light"
+        rows += f"""
+        <div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border)">
+          <span style="font-size:.75rem;color:var(--muted);width:16px;text-align:right">{i+1}</span>
+          <div style="flex:1;min-width:0">
+            <a href="{link}" target="_blank" style="color:var(--accent);text-decoration:none;font-size:.85rem;
+               white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block">{c['name']}</a>
+            <div style="font-size:.7rem;color:var(--muted)">{c['model']} · {c['duration_hrs']:.1f}h · {label}</div>
+          </div>
+          <div style="width:80px;background:var(--border);border-radius:4px;height:6px;flex-shrink:0">
+            <div style="width:{bar_width:.0f}%;background:{bar_color};border-radius:4px;height:100%"></div>
+          </div>
+        </div>"""
+
+    # Model mix breakdown
+    model_counts = {}
+    for c in conversations[:20]:
+        m = MODEL_DISPLAY.get(c.get("model", ""), "Other")
+        model_counts[m] = model_counts.get(m, 0) + 1
+    total = sum(model_counts.values())
+    mix_parts = " · ".join(f"{m}: {n}" for m, n in sorted(model_counts.items(), key=lambda x: -x[1]))
+
+    return f"""
+    <div class="card">
+      <h2>Conversation Cost Ranking (Estimated)</h2>
+      <p style="font-size:.75rem;color:var(--muted);margin-bottom:10px">
+        Ranked by model weight x duration. Longer Opus conversations cost more.
+      </p>
+      {rows}
+      <div style="font-size:.75rem;color:var(--muted);margin-top:12px;padding-top:8px;border-top:1px solid var(--border)">
+        Model mix (last {total}): {mix_parts}
+      </div>
+    </div>"""
+
+
+def _optimal_timing_html(stats):
+    """Show optimal timing insights based on day-of-week and burn patterns."""
+    if not stats:
+        return ""
+    patterns = stats.get("day_patterns")
+    if not patterns or len(patterns) < 5:
+        return ""
+
+    today = datetime.now().weekday()
+    sorted_days = sorted(patterns.items(), key=lambda x: x[1])
+    lightest_dow, lightest_val = sorted_days[0]
+    heaviest_dow, heaviest_val = sorted_days[-1]
+
+    overall_avg = sum(patterns.values()) / len(patterns)
+
+    # Build heatmap-style row
+    cells = ""
+    for dow in range(7):
+        val = patterns.get(dow, 0)
+        if val > overall_avg * 1.4:
+            bg = "rgba(239,68,68,0.2)"
+            border = "#ef4444"
+        elif val > overall_avg * 0.8:
+            bg = "rgba(245,158,11,0.15)"
+            border = "#f59e0b"
+        else:
+            bg = "rgba(34,197,94,0.15)"
+            border = "#22c55e"
+        is_today = "2px solid var(--accent)" if dow == today else f"1px solid {border}"
+        today_label = "<div style='font-size:.55rem;color:var(--accent)'>TODAY</div>" if dow == today else ""
+        cells += f"""
+        <div style="flex:1;text-align:center;padding:8px 4px;background:{bg};border:{is_today};border-radius:6px">
+          <div style="font-size:.7rem;color:var(--muted)">{DOW_SHORT[dow]}</div>
+          <div style="font-size:1rem;font-weight:700">{val:.1f}%</div>
+          {today_label}
+        </div>"""
+
+    # Actionable insight
+    days_to_lightest = (lightest_dow - today) % 7
+    days_to_heaviest = (heaviest_dow - today) % 7
+
+    insights = []
+    if days_to_lightest == 0:
+        insights.append("Today is typically your lightest day — great time for complex Opus work.")
+    elif days_to_lightest <= 2:
+        insights.append(f"{DOW_NAMES[lightest_dow]} is your lightest day — save Opus-heavy work for then.")
+
+    if days_to_heaviest == 0:
+        insights.append("Today is typically your heaviest day — consider front-loading important work early.")
+    elif days_to_heaviest == 1:
+        insights.append(f"Tomorrow ({DOW_NAMES[heaviest_dow]}) is typically heavy — plan accordingly.")
+
+    # Budget recommendation based on today's pattern
+    today_expected = patterns.get(today, overall_avg)
+    burn_rate = stats.get("burn_per_day", 0)
+    budget = stats.get("daily_budget", 0)
+    if today_expected > overall_avg * 1.3 and budget > 0:
+        insights.append(f"Today's typical burn ({today_expected:.1f}%) exceeds your avg ({overall_avg:.1f}%). Budget: {budget:.1f}%/day to stay safe.")
+
+    insights_html = "".join(f"<li style='margin-bottom:4px'>{i}</li>" for i in insights) if insights else "<li>Your usage is evenly distributed — no strong patterns yet.</li>"
+
+    return f"""
+    <div class="card">
+      <h2>Optimal Timing</h2>
+      <p style="font-size:.75rem;color:var(--muted);margin-bottom:10px">
+        Average daily burn rate by day of week. Plan heavy work on green days.
+      </p>
+      <div style="display:flex;gap:4px;margin-bottom:14px">
+        {cells}
+      </div>
+      <ul style="font-size:.85rem;padding-left:18px;line-height:1.7;color:var(--text)">
+        {insights_html}
+      </ul>
+    </div>"""
+
+
 def _power_user_dashboard_html(usage, stats, velocity, runway, msg_est):
     """Render the power-user analytics section of the dashboard."""
     sections = []
@@ -1095,6 +1265,10 @@ def generate_dashboard(usage, stats, conversations=None):
     else:
         suggestion_html = ""
 
+    # Conversation insights and optimal timing
+    conv_insights_html = _conversation_insights_html(conversations)
+    timing_html = _optimal_timing_html(stats)
+
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1208,6 +1382,8 @@ def generate_dashboard(usage, stats, conversations=None):
 {session_html}
 {chart_html}
 {pattern_html}
+{timing_html}
+{conv_insights_html}
 {conversations_html}
 {_model_guide_html(usage, stats)}
 
@@ -1320,7 +1496,27 @@ a:hover {{ text-decoration: underline; }}
 </table></body></html>"""
 
 
-def _build_title(usage, config, velocity=None):
+SPARKLINE_CHARS = "▁▂▃▄▅▆▇█"
+
+
+def _sparkline(values, width=6):
+    """Build a tiny sparkline string from a list of numeric values."""
+    if not values or len(values) < 2:
+        return ""
+    recent = values[-width:]
+    lo, hi = min(recent), max(recent)
+    spread = hi - lo
+    if spread < 0.5:
+        # Flat line — all same level
+        idx = min(int(lo / 100 * (len(SPARKLINE_CHARS) - 1)), len(SPARKLINE_CHARS) - 1)
+        return SPARKLINE_CHARS[idx] * len(recent)
+    return "".join(
+        SPARKLINE_CHARS[min(int((v - lo) / spread * (len(SPARKLINE_CHARS) - 1)), len(SPARKLINE_CHARS) - 1)]
+        for v in recent
+    )
+
+
+def _build_title(usage, config, velocity=None, recent_session_pcts=None):
     if usage is None:
         return "!"
     parts = []
@@ -1329,6 +1525,9 @@ def _build_title(usage, config, velocity=None):
         if velocity and abs(velocity["session_delta"]) >= 0.1:
             d = velocity["session_delta"]
             s_str += f"+{d:.0f}" if d > 0 else f"{d:.0f}"
+        # Sparkline of recent session readings
+        if recent_session_pcts and len(recent_session_pcts) >= 3:
+            s_str += _sparkline(recent_session_pcts)
         parts.append(s_str)
     if config.get("show_weekly_pct"):
         w_str = f"{usage['weekly_pct']:.0f}%"
@@ -1631,6 +1830,8 @@ class ClaudeMonitorApp(rumps.App):
             self._runway   = calc_runway(usage, self._velocity)
             self._msg_est  = estimate_messages_remaining(usage, rows)
             self._suggestion = smart_suggestion(usage, self._stats, self._velocity)
+            # Recent session pcts for sparkline (last ~8 readings)
+            self._recent_session_pcts = [r[1] for r in rows[-8:]] if rows else []
             try:
                 self._conversations = self._fetch_conversations_data()
             except Exception:
@@ -1650,8 +1851,16 @@ class ClaudeMonitorApp(rumps.App):
 
         # Reset session keys when session resets_at changes
         if sreset != self._last_session_reset:
+            old_reset = self._last_session_reset
             self._notified = {k for k in self._notified if not k.startswith("session_")}
             self._last_session_reset = sreset
+            # Notify on new session (but not on first launch)
+            if old_reset is not None and sreset:
+                rumps.notification(
+                    "ClaudeWatch",
+                    "New session started",
+                    "Fresh 5-hour window — slate is clean.",
+                )
 
         sr = _fmt_reset(sreset)
         wr = _fmt_reset(usage.get("weekly_resets_at", ""))
@@ -1696,8 +1905,9 @@ class ClaudeMonitorApp(rumps.App):
         runway   = getattr(self, "_runway", None)
         msg_est  = getattr(self, "_msg_est", None)
         suggestion = getattr(self, "_suggestion", None)
+        recent_pcts = getattr(self, "_recent_session_pcts", None)
 
-        self.title = _build_title(usage, self.config, velocity)
+        self.title = _build_title(usage, self.config, velocity, recent_pcts)
 
         if self.config.get("show_hover_tooltip", True):
             self._set_tooltip(_build_tooltip(usage, velocity, runway, msg_est))

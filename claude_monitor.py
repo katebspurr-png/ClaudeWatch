@@ -503,6 +503,192 @@ def _per_model_html(usage):
     </div>"""
 
 
+# ─── Power-user analytics ────────────────────────────────────────────────────
+
+def calc_velocity(rows, window_minutes=30):
+    """
+    Calculate burn velocity over the last `window_minutes`.
+    Returns dict with session and weekly velocity (% per hour),
+    delta since last reading, and raw deltas.
+    """
+    if len(rows) < 2:
+        return None
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(minutes=window_minutes)
+
+    # Find readings within the window
+    window_rows = []
+    for ts, s_pct, w_pct, *_ in rows:
+        try:
+            dt = datetime.fromisoformat(ts)
+        except Exception:
+            continue
+        if dt >= cutoff:
+            window_rows.append((dt, s_pct, w_pct))
+
+    # Delta since last refresh (last two readings regardless of window)
+    last_ts, last_s, last_w, *_ = rows[-1]
+    prev_ts, prev_s, prev_w, *_ = rows[-2]
+    session_delta = last_s - prev_s
+    weekly_delta = last_w - prev_w
+
+    if len(window_rows) >= 2:
+        first_dt, first_s, first_w = window_rows[0]
+        last_dt, last_s_w, last_w_w = window_rows[-1]
+        hours = max((last_dt - first_dt).total_seconds() / 3600, 0.001)
+        session_velocity = (last_s_w - first_s) / hours  # % per hour
+        weekly_velocity = (last_w_w - first_w) / hours
+    else:
+        session_velocity = 0
+        weekly_velocity = 0
+
+    return {
+        "session_velocity": session_velocity,  # % per hour
+        "weekly_velocity": weekly_velocity,
+        "session_delta": session_delta,        # change since last refresh
+        "weekly_delta": weekly_delta,
+        "window_minutes": window_minutes,
+    }
+
+
+def calc_runway(usage, velocity):
+    """
+    Estimate time until session/weekly limits at current pace.
+    Returns dict with runway estimates in minutes, or None if not burning.
+    """
+    result = {}
+
+    spct = usage["session_pct"]
+    wpct = usage["weekly_pct"]
+
+    # Session runway
+    s_vel = velocity["session_velocity"] if velocity else 0
+    if s_vel > 0.1:  # meaningful burn rate (>0.1%/hr)
+        remaining = 100 - spct
+        hours_left = remaining / s_vel
+        result["session_runway_min"] = hours_left * 60
+    else:
+        result["session_runway_min"] = None
+
+    # Weekly runway
+    w_vel = velocity["weekly_velocity"] if velocity else 0
+    if w_vel > 0.1:
+        remaining = 100 - wpct
+        hours_left = remaining / w_vel
+        result["weekly_runway_min"] = hours_left * 60
+    else:
+        result["weekly_runway_min"] = None
+
+    return result
+
+
+def estimate_messages_remaining(usage, rows):
+    """
+    Estimate how many messages remain based on average % cost per interaction.
+    Looks at positive session_pct deltas (each one ~ a message or burst).
+    Returns dict with estimates per model, or None if not enough data.
+    """
+    if len(rows) < 5:
+        return None
+
+    # Collect positive session deltas (each represents usage from a message/burst)
+    deltas = []
+    prev_s = None
+    prev_reset = None
+    for ts, s_pct, w_pct, reset_at, *_ in rows:
+        if prev_s is not None:
+            # Skip if session reset happened (reset_at changed)
+            if reset_at != prev_reset and s_pct < prev_s:
+                prev_s = s_pct
+                prev_reset = reset_at
+                continue
+            inc = s_pct - prev_s
+            if 0.1 < inc < 30:  # plausible single interaction (0.1% to 30%)
+                deltas.append(inc)
+        prev_s = s_pct
+        prev_reset = reset_at
+
+    if len(deltas) < 3:
+        return None
+
+    avg_cost = sum(deltas) / len(deltas)
+    median_cost = sorted(deltas)[len(deltas) // 2]
+
+    session_remaining = max(100 - usage["session_pct"], 0)
+    weekly_remaining = max(100 - usage["weekly_pct"], 0)
+
+    # Use median for more robust estimate (outliers from big prompts)
+    cost = median_cost if median_cost > 0 else avg_cost
+    if cost <= 0:
+        return None
+
+    return {
+        "avg_cost_per_msg": avg_cost,
+        "median_cost_per_msg": median_cost,
+        "session_msgs_left": int(session_remaining / cost),
+        "weekly_msgs_left": int(weekly_remaining / cost),
+        "sample_size": len(deltas),
+    }
+
+
+def smart_suggestion(usage, stats, velocity):
+    """
+    Generate a single actionable suggestion string for the menu bar.
+    Returns (emoji, text) or None.
+    """
+    spct = usage["session_pct"]
+    wpct = usage["weekly_pct"]
+
+    # Urgent: session almost full
+    if spct >= 85:
+        sr = _fmt_reset(usage.get("session_resets_at", ""))
+        return ("🔴", f"Session nearly full — resets in {sr}" if sr else "Session nearly full — pause and wait for reset")
+
+    # Burning fast right now
+    if velocity and velocity["session_velocity"] > 20:
+        return ("🔥", f"Burning {velocity['session_velocity']:.0f}%/hr — switch to Haiku for lighter tasks")
+
+    # Weekly getting high, suggest conservation
+    if wpct >= 70:
+        if stats and stats["days_until_reset"] > 2:
+            return ("⚠️", f"Weekly at {wpct:.0f}% with {stats['days_until_reset']:.0f}d left — use Haiku where possible")
+        elif stats:
+            return ("⚠️", f"Weekly at {wpct:.0f}% — resets in {stats['days_until_reset']:.1f}d, conserve Opus")
+
+    # Will hit limit before reset
+    if stats and stats.get("hits_limit"):
+        return ("⚠️", "On track to hit weekly limit — switch to Haiku for routine tasks")
+
+    # Session heating up
+    if spct >= 60:
+        return ("🟡", f"Session at {spct:.0f}% — consider batching questions or switching to Haiku")
+
+    # Everything's fine, encourage Opus if lots of headroom
+    if wpct < 20 and spct < 30:
+        return ("🟢", "Plenty of headroom — good time for Opus on complex tasks")
+
+    if wpct < 40:
+        return ("🟢", "Usage healthy — Sonnet for most tasks, Opus when needed")
+
+    return None
+
+
+def _fmt_runway(minutes):
+    """Format runway minutes into readable string."""
+    if minutes is None:
+        return None
+    if minutes < 1:
+        return "<1 min"
+    if minutes < 60:
+        return f"{minutes:.0f} min"
+    hours = minutes / 60
+    if hours < 24:
+        return f"{hours:.1f}h"
+    days = hours / 24
+    return f"{days:.1f}d"
+
+
 def load_session_history():
     """Return recent session data points with reset boundaries from DB."""
     conn = sqlite3.connect(str(DB_PATH))
@@ -622,6 +808,114 @@ def _conversations_dashboard_html(conversations):
 
 
 # ─── Dashboard HTML ──────────────────────────────────────────────────────────
+
+def _power_user_dashboard_html(usage, stats, velocity, runway, msg_est):
+    """Render the power-user analytics section of the dashboard."""
+    sections = []
+
+    # Live Pace card
+    if velocity and velocity["session_velocity"] > 0.1:
+        s_vel = velocity["session_velocity"]
+        w_vel = velocity["weekly_velocity"]
+        s_delta = velocity["session_delta"]
+        w_delta = velocity["weekly_delta"]
+
+        # Pace indicator
+        if s_vel > 20:
+            pace_icon, pace_label, pace_color = "🔥", "Sprinting", "#ef4444"
+        elif s_vel > 8:
+            pace_icon, pace_label, pace_color = "🟡", "Moderate", "#f59e0b"
+        else:
+            pace_icon, pace_label, pace_color = "🟢", "Cruising", "#22c55e"
+
+        delta_s_str = f"+{s_delta:.1f}%" if s_delta > 0 else f"{s_delta:.1f}%"
+        delta_w_str = f"+{w_delta:.1f}%" if w_delta > 0 else f"{w_delta:.1f}%"
+
+        sections.append(f"""
+        <div class="card">
+          <h2>Live Pace</h2>
+          <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
+            <span style="font-size:2rem">{pace_icon}</span>
+            <div>
+              <div class="big" style="font-size:1.6rem;color:{pace_color}">{pace_label}</div>
+              <div class="label">{s_vel:.1f}%/hr session · {w_vel:.1f}%/hr weekly</div>
+            </div>
+          </div>
+          <div style="display:flex;gap:24px;font-size:.85rem;color:var(--muted)">
+            <span>Session delta: <b style="color:var(--text)">{delta_s_str}</b></span>
+            <span>Weekly delta: <b style="color:var(--text)">{delta_w_str}</b></span>
+          </div>
+        </div>""")
+
+    # Runway card
+    if runway:
+        sr = _fmt_runway(runway.get("session_runway_min"))
+        wr = _fmt_runway(runway.get("weekly_runway_min"))
+        if sr or wr:
+            items = []
+            if sr:
+                sr_min = runway["session_runway_min"]
+                sr_color = "#ef4444" if sr_min < 30 else "#f59e0b" if sr_min < 120 else "#22c55e"
+                items.append(f"""
+                <div style="flex:1;text-align:center;padding:12px;background:var(--bg);border-radius:8px">
+                  <div style="font-size:1.6rem;font-weight:700;color:{sr_color}">~{sr}</div>
+                  <div class="label">until session limit</div>
+                </div>""")
+            if wr:
+                wr_min = runway["weekly_runway_min"]
+                wr_color = "#ef4444" if wr_min < 1440 else "#f59e0b" if wr_min < 4320 else "#22c55e"
+                items.append(f"""
+                <div style="flex:1;text-align:center;padding:12px;background:var(--bg);border-radius:8px">
+                  <div style="font-size:1.6rem;font-weight:700;color:{wr_color}">~{wr}</div>
+                  <div class="label">until weekly limit</div>
+                </div>""")
+            sections.append(f"""
+            <div class="card">
+              <h2>Runway — At Current Pace</h2>
+              <div style="display:flex;gap:12px">{"".join(items)}</div>
+              <p style="font-size:.75rem;color:var(--muted);margin-top:10px">Based on your burn rate over the last 30 minutes</p>
+            </div>""")
+
+    # Messages remaining card
+    if msg_est:
+        s_msgs = msg_est["session_msgs_left"]
+        w_msgs = msg_est["weekly_msgs_left"]
+        samples = msg_est["sample_size"]
+        avg_cost = msg_est["avg_cost_per_msg"]
+
+        s_color = "#ef4444" if s_msgs < 5 else "#f59e0b" if s_msgs < 15 else "#22c55e"
+        w_color = "#ef4444" if w_msgs < 10 else "#f59e0b" if w_msgs < 30 else "#22c55e"
+
+        sections.append(f"""
+        <div class="card">
+          <h2>Messages Remaining (Estimate)</h2>
+          <div style="display:flex;gap:12px">
+            <div style="flex:1;text-align:center;padding:12px;background:var(--bg);border-radius:8px">
+              <div style="font-size:2rem;font-weight:700;color:{s_color}">~{s_msgs}</div>
+              <div class="label">this session</div>
+            </div>
+            <div style="flex:1;text-align:center;padding:12px;background:var(--bg);border-radius:8px">
+              <div style="font-size:2rem;font-weight:700;color:{w_color}">~{w_msgs}</div>
+              <div class="label">this week</div>
+            </div>
+          </div>
+          <p style="font-size:.75rem;color:var(--muted);margin-top:10px">
+            Based on {samples} recent interactions (avg {avg_cost:.1f}% per message).
+            Actual count varies by message length and model.
+          </p>
+        </div>""")
+
+    if not sections:
+        return ""
+
+    return f"""
+    <div style="margin-bottom:16px">
+      <h2 style="font-size:.8rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:12px">
+        Live Intelligence
+      </h2>
+      {"".join(sections)}
+    </div>"""
+
 
 def generate_dashboard(usage, stats, conversations=None):
     spct     = usage["session_pct"]
@@ -780,6 +1074,27 @@ def generate_dashboard(usage, stats, conversations=None):
 
     conversations_html = _conversations_dashboard_html(conversations)
 
+    # Power-user analytics
+    history_rows = load_history()
+    velocity = calc_velocity(history_rows)
+    runway = calc_runway(usage, velocity)
+    msg_est = estimate_messages_remaining(usage, history_rows)
+    power_user_html = _power_user_dashboard_html(usage, stats, velocity, runway, msg_est)
+
+    # Smart suggestion banner
+    suggestion = smart_suggestion(usage, stats, velocity)
+    if suggestion:
+        s_emoji, s_text = suggestion
+        suggestion_html = f"""
+        <div style="background:var(--surface);border:1px solid var(--border);border-left:3px solid var(--accent);
+                    border-radius:var(--radius);padding:14px 16px;margin-bottom:16px;font-size:.9rem;
+                    display:flex;align-items:center;gap:10px">
+          <span style="font-size:1.3rem">{s_emoji}</span>
+          <span>{s_text}</span>
+        </div>"""
+    else:
+        suggestion_html = ""
+
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -886,6 +1201,8 @@ def generate_dashboard(usage, stats, conversations=None):
   </div>
 </div>
 
+{suggestion_html}
+{power_user_html}
 {extra_html}
 {per_model_html}
 {session_html}
@@ -1003,14 +1320,22 @@ a:hover {{ text-decoration: underline; }}
 </table></body></html>"""
 
 
-def _build_title(usage, config):
+def _build_title(usage, config, velocity=None):
     if usage is None:
         return "!"
     parts = []
     if config.get("show_session_pct"):
-        parts.append(f"{usage['session_pct']:.0f}%")
+        s_str = f"{usage['session_pct']:.0f}%"
+        if velocity and abs(velocity["session_delta"]) >= 0.1:
+            d = velocity["session_delta"]
+            s_str += f"+{d:.0f}" if d > 0 else f"{d:.0f}"
+        parts.append(s_str)
     if config.get("show_weekly_pct"):
-        parts.append(f"{usage['weekly_pct']:.0f}%")
+        w_str = f"{usage['weekly_pct']:.0f}%"
+        if velocity and abs(velocity["weekly_delta"]) >= 0.1:
+            d = velocity["weekly_delta"]
+            w_str += f"+{d:.0f}" if d > 0 else f"{d:.0f}"
+        parts.append(w_str)
     title = " | ".join(parts) if parts else "◈"
     if config.get("show_reset_time"):
         reset = _fmt_reset(usage.get("session_resets_at", ""))
@@ -1025,7 +1350,7 @@ def _build_title(usage, config):
     return title
 
 
-def _build_tooltip(usage):
+def _build_tooltip(usage, velocity=None, runway=None, msg_est=None):
     if usage is None:
         return "ClaudeWatch — no data"
     spct = usage.get("session_pct", 0)
@@ -1037,6 +1362,23 @@ def _build_tooltip(usage):
         f"Session (5h):  {spct:.0f}%" + (f"  —  resets in {sr}" if sr else ""),
         f"Weekly  (7d):  {wpct:.0f}%" + (f"  —  resets in {wr}" if wr else ""),
     ]
+    # Velocity
+    if velocity and velocity["session_velocity"] > 0.1:
+        lines.append(f"Pace:  {velocity['session_velocity']:.1f}%/hr session, {velocity['weekly_velocity']:.1f}%/hr weekly")
+    # Runway
+    if runway:
+        parts = []
+        sr_run = _fmt_runway(runway.get("session_runway_min"))
+        wr_run = _fmt_runway(runway.get("weekly_runway_min"))
+        if sr_run:
+            parts.append(f"session limit in ~{sr_run}")
+        if wr_run:
+            parts.append(f"weekly limit in ~{wr_run}")
+        if parts:
+            lines.append("Runway:  " + ", ".join(parts))
+    # Messages remaining
+    if msg_est:
+        lines.append(f"~{msg_est['session_msgs_left']} msgs left in session, ~{msg_est['weekly_msgs_left']} this week")
     # Per-model breakdowns
     for label, info in usage.get("per_model", {}).items():
         pct = info["utilization"]
@@ -1143,10 +1485,16 @@ class ClaudeMonitorApp(rumps.App):
             None,
             rumps.MenuItem("⬤  Session (5h)",   callback=None),
             rumps.MenuItem("   —",               callback=None),
+            rumps.MenuItem("   session_runway",  callback=None),
             rumps.MenuItem("⬤  Weekly (7d)",    callback=None),
             rumps.MenuItem("   —  ",             callback=None),
+            rumps.MenuItem("   weekly_runway",   callback=None),
             rumps.MenuItem("   per_model_line",  callback=None),
             rumps.MenuItem("   extra_credits",   callback=None),
+            None,
+            rumps.MenuItem("   velocity_line",   callback=None),
+            rumps.MenuItem("   msgs_remaining",  callback=None),
+            rumps.MenuItem("   suggestion_line", callback=None),
             None,
             model_guide,
             settings,
@@ -1156,8 +1504,10 @@ class ClaudeMonitorApp(rumps.App):
             rumps.MenuItem("Quit",               callback=self.quit_app),
         ]
 
-        # Hide per-model and extra items initially
-        for key in ("   per_model_line", "   extra_credits"):
+        # Hide dynamic items initially
+        for key in ("   per_model_line", "   extra_credits",
+                    "   session_runway", "   weekly_runway",
+                    "   velocity_line", "   msgs_remaining", "   suggestion_line"):
             self.menu[key].hidden = True
 
         if DEPS_OK:
@@ -1277,6 +1627,10 @@ class ClaudeMonitorApp(rumps.App):
             log_usage(usage)
             rows         = load_history()
             self._stats  = calculate_stats(usage, rows)
+            self._velocity = calc_velocity(rows)
+            self._runway   = calc_runway(usage, self._velocity)
+            self._msg_est  = estimate_messages_remaining(usage, rows)
+            self._suggestion = smart_suggestion(usage, self._stats, self._velocity)
             try:
                 self._conversations = self._fetch_conversations_data()
             except Exception:
@@ -1338,10 +1692,15 @@ class ClaudeMonitorApp(rumps.App):
             self._set_tooltip(f"ClaudeWatch — error\n{error[:120]}")
             return
 
-        self.title = _build_title(usage, self.config)
+        velocity = getattr(self, "_velocity", None)
+        runway   = getattr(self, "_runway", None)
+        msg_est  = getattr(self, "_msg_est", None)
+        suggestion = getattr(self, "_suggestion", None)
+
+        self.title = _build_title(usage, self.config, velocity)
 
         if self.config.get("show_hover_tooltip", True):
-            self._set_tooltip(_build_tooltip(usage))
+            self._set_tooltip(_build_tooltip(usage, velocity, runway, msg_est))
         else:
             self._set_tooltip("")
 
@@ -1352,12 +1711,29 @@ class ClaudeMonitorApp(rumps.App):
 
         self.menu[session_header].title = f"⬤  Session (5h) — {spct:.1f}%"
         self.menu[session_detail].title = f"   resets in {sreset}" if sreset else "   —"
+
+        # Session runway
+        if runway and runway.get("session_runway_min") is not None:
+            sr_run = _fmt_runway(runway["session_runway_min"])
+            self.menu["   session_runway"].title = f"   ⏱ limit in ~{sr_run} at this pace"
+            self.menu["   session_runway"].hidden = False
+        else:
+            self.menu["   session_runway"].hidden = True
+
         self.menu[weekly_header].title  = f"⬤  Weekly (7d) — {wpct:.1f}%"
 
         if wreset:
             self.menu[weekly_detail].title = f"   resets in {wreset}"
         else:
             self.menu[weekly_detail].title = "   —  "
+
+        # Weekly runway
+        if runway and runway.get("weekly_runway_min") is not None:
+            wr_run = _fmt_runway(runway["weekly_runway_min"])
+            self.menu["   weekly_runway"].title = f"   ⏱ limit in ~{wr_run} at this pace"
+            self.menu["   weekly_runway"].hidden = False
+        else:
+            self.menu["   weekly_runway"].hidden = True
 
         # Per-model breakdowns (combined sub-line in weekly section)
         per_model = usage.get("per_model", {})
@@ -1386,6 +1762,34 @@ class ClaudeMonitorApp(rumps.App):
             self.menu["   extra_credits"].hidden = False
         else:
             self.menu["   extra_credits"].hidden = True
+
+        # Velocity line
+        if velocity and velocity["session_velocity"] > 0.1:
+            self.menu["   velocity_line"].title = (
+                f"   🔥 Burning {velocity['session_velocity']:.1f}%/hr session"
+                f" · {velocity['weekly_velocity']:.1f}%/hr weekly"
+            )
+            self.menu["   velocity_line"].hidden = False
+        else:
+            self.menu["   velocity_line"].hidden = True
+
+        # Messages remaining
+        if msg_est:
+            self.menu["   msgs_remaining"].title = (
+                f"   ~{msg_est['session_msgs_left']} msgs left in session"
+                f" · ~{msg_est['weekly_msgs_left']} this week"
+            )
+            self.menu["   msgs_remaining"].hidden = False
+        else:
+            self.menu["   msgs_remaining"].hidden = True
+
+        # Smart suggestion
+        if suggestion:
+            emoji, text = suggestion
+            self.menu["   suggestion_line"].title = f"   {emoji} {text}"
+            self.menu["   suggestion_line"].hidden = False
+        else:
+            self.menu["   suggestion_line"].hidden = True
 
 
 # ─── Entry point ─────────────────────────────────────────────────────────────

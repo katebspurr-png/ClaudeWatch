@@ -42,7 +42,8 @@ DEFAULT_CONFIG = {
 }
 
 CREDITS_PER_DOLLAR = 100   # 1 credit = $0.01 (confirmed against billing)
-WARN_THRESHOLDS    = [80, 90, 100]  # % weekly usage to notify at
+USAGE_THRESHOLDS   = [25, 50, 75, 90]  # % usage to notify at (session + weekly)
+EXTRA_THRESHOLDS   = [50, 75, 90, 95]  # % extra credits to notify at
 
 
 # ─── Cookie decryption ───────────────────────────────────────────────────────
@@ -114,6 +115,17 @@ def fetch_claude_usage():
     seven_day = data.get("seven_day")  or {}
     extra     = data.get("extra_usage") or {}
 
+    # Per-model breakdowns (non-null only for Max plan users)
+    per_model = {}
+    for key in ("seven_day_opus", "seven_day_sonnet", "seven_day_cowork"):
+        val = data.get(key)
+        if val and isinstance(val, dict) and val.get("utilization") is not None:
+            label = key.replace("seven_day_", "").capitalize()
+            per_model[label] = {
+                "utilization": val["utilization"],
+                "resets_at":   val.get("resets_at", ""),
+            }
+
     return {
         "session_pct":       five_hour.get("utilization", 0.0),
         "weekly_pct":        seven_day.get("utilization",  0.0),
@@ -121,6 +133,9 @@ def fetch_claude_usage():
         "weekly_resets_at":  seven_day.get("resets_at",  ""),
         "extra_used":        extra.get("used_credits"),
         "extra_limit":       extra.get("monthly_limit"),
+        "extra_enabled":     extra.get("is_enabled", False),
+        "extra_pct":         extra.get("utilization"),
+        "per_model":         per_model,
     }
 
 
@@ -662,10 +677,17 @@ def _build_tooltip(usage):
         f"Session (5h):  {spct:.0f}%" + (f"  —  resets in {sr}" if sr else ""),
         f"Weekly  (7d):  {wpct:.0f}%" + (f"  —  resets in {wr}" if wr else ""),
     ]
+    # Per-model breakdowns
+    for label, info in usage.get("per_model", {}).items():
+        pct = info["utilization"]
+        lines.append(f"  {label}:  {pct:.0f}%")
+    # Extra credits
     eu = usage.get("extra_used")
     el = usage.get("extra_limit")
     if eu is not None and el:
-        lines.append(f"Extra usage:  ${eu/CREDITS_PER_DOLLAR:.2f} / ${el/CREDITS_PER_DOLLAR:.2f}")
+        extra_pct = usage.get("extra_pct", 0)
+        warn = "⚠️ " if extra_pct and extra_pct >= 90 else ""
+        lines.append(f"{warn}Extra usage:  ${eu/CREDITS_PER_DOLLAR:.2f} / ${el/CREDITS_PER_DOLLAR:.2f} ({extra_pct:.0f}%)")
     return "\n".join(lines)
 
 
@@ -684,7 +706,9 @@ class ClaudeMonitorApp(rumps.App):
         self.config          = load_config()
         self._usage          = None
         self._stats          = None
-        self._warned_at      = set()   # thresholds already notified this week
+        self._warned_weekly  = set()   # weekly thresholds already notified
+        self._warned_session = set()   # session thresholds already notified
+        self._warned_extra   = set()   # extra credits thresholds already notified
 
         if DEPS_OK:
             init_db()
@@ -764,6 +788,10 @@ class ClaudeMonitorApp(rumps.App):
             rumps.MenuItem("   —",               callback=None),
             rumps.MenuItem("⬤  Weekly (7d)",    callback=None),
             rumps.MenuItem("   —  ",             callback=None),
+            rumps.MenuItem("   per_model_opus",  callback=None),
+            rumps.MenuItem("   per_model_sonnet", callback=None),
+            rumps.MenuItem("   per_model_cowork", callback=None),
+            rumps.MenuItem("   extra_credits",   callback=None),
             None,
             model_guide,
             settings,
@@ -771,6 +799,11 @@ class ClaudeMonitorApp(rumps.App):
             None,
             rumps.MenuItem("Quit",               callback=self.quit_app),
         ]
+
+        # Hide per-model and extra items initially
+        for key in ("   per_model_opus", "   per_model_sonnet",
+                     "   per_model_cowork", "   extra_credits"):
+            self.menu[key].hidden = True
 
         if DEPS_OK:
             self._start_timer()
@@ -882,34 +915,64 @@ class ClaudeMonitorApp(rumps.App):
 
     def _check_limits(self, usage):
         wpct   = usage["weekly_pct"]
+        spct   = usage["session_pct"]
         wreset = usage.get("weekly_resets_at", "")
+        sreset = usage.get("session_resets_at", "")
 
-        # Reset warned set when a new weekly period starts
+        # Reset warned sets when periods change
         try:
             reset_dt  = datetime.fromisoformat(wreset.replace("Z", "+00:00"))
-            period_id = reset_dt.strftime("%Y-%W")   # year + week number
+            period_id = reset_dt.strftime("%Y-%W")
             if getattr(self, "_warned_period", None) != period_id:
-                self._warned_at     = set()
+                self._warned_weekly = set()
+                self._warned_extra  = set()
                 self._warned_period = period_id
         except Exception:
             pass
 
-        for threshold in WARN_THRESHOLDS:
-            if wpct >= threshold and threshold not in self._warned_at:
-                self._warned_at.add(threshold)
+        try:
+            sreset_dt  = datetime.fromisoformat(sreset.replace("Z", "+00:00"))
+            session_id = sreset_dt.isoformat()
+            if getattr(self, "_warned_session_id", None) != session_id:
+                self._warned_session = set()
+                self._warned_session_id = session_id
+        except Exception:
+            pass
+
+        # Weekly usage notifications
+        for threshold in USAGE_THRESHOLDS:
+            if wpct >= threshold and threshold not in self._warned_weekly:
+                self._warned_weekly.add(threshold)
                 wr = _fmt_reset(wreset)
-                if threshold == 100:
+                rumps.notification(
+                    f"ClaudeWatch — {threshold}% Weekly Usage",
+                    f"You've used {wpct:.0f}% of your weekly limit",
+                    f"Resets in {wr}." if wr else "",
+                )
+
+        # Session usage notifications
+        for threshold in USAGE_THRESHOLDS:
+            if spct >= threshold and threshold not in self._warned_session:
+                self._warned_session.add(threshold)
+                sr = _fmt_reset(sreset)
+                rumps.notification(
+                    f"ClaudeWatch — {threshold}% Session Usage",
+                    f"5-hour session at {spct:.0f}%",
+                    f"Resets in {sr}." if sr else "",
+                )
+
+        # Extra credits notifications
+        extra_pct = usage.get("extra_pct")
+        if extra_pct is not None:
+            for threshold in EXTRA_THRESHOLDS:
+                if extra_pct >= threshold and threshold not in self._warned_extra:
+                    self._warned_extra.add(threshold)
+                    eu = usage.get("extra_used", 0)
+                    el = usage.get("extra_limit", 0)
                     rumps.notification(
-                        "ClaudeWatch — Limit Reached",
-                        "Weekly usage at 100%",
-                        f"Resets in {wr}." if wr else "You've hit your weekly limit.",
-                    )
-                else:
-                    rumps.notification(
-                        f"ClaudeWatch — {threshold}% Weekly Usage",
-                        f"You've used {wpct:.0f}% of your weekly limit",
-                        f"Resets in {wr}. Consider switching to Haiku for lighter tasks."
-                        if wr else "Consider switching to Haiku for lighter tasks.",
+                        f"ClaudeWatch — Extra Credits {threshold}%",
+                        f"${eu/CREDITS_PER_DOLLAR:.2f} of ${el/CREDITS_PER_DOLLAR:.2f} used",
+                        "Approaching monthly extra usage cap!" if threshold >= 90 else "",
                     )
 
     def _apply_ui(self, usage, error=None):
@@ -940,18 +1003,38 @@ class ClaudeMonitorApp(rumps.App):
         self.menu[session_detail].title = f"   resets in {sreset}" if sreset else "   —"
         self.menu[weekly_header].title  = f"⬤  Weekly (7d) — {wpct:.1f}%"
 
-        eu = usage.get("extra_used")
-        el = usage.get("extra_limit")
-        if eu is not None and el:
-            extra_str = f"${eu/CREDITS_PER_DOLLAR:.2f} / ${el/CREDITS_PER_DOLLAR:.2f}"
-            self.menu[weekly_detail].title = (
-                f"   resets in {wreset}  ·  extra {extra_str}"
-                if wreset else f"   extra {extra_str}"
-            )
-        elif wreset:
+        if wreset:
             self.menu[weekly_detail].title = f"   resets in {wreset}"
         else:
             self.menu[weekly_detail].title = "   —  "
+
+        # Per-model breakdowns
+        per_model = usage.get("per_model", {})
+        model_keys = {"Opus": "   per_model_opus", "Sonnet": "   per_model_sonnet",
+                      "Cowork": "   per_model_cowork"}
+        for label, menu_key in model_keys.items():
+            if label in per_model:
+                pct = per_model[label]["utilization"]
+                reset = _fmt_reset(per_model[label].get("resets_at", ""))
+                self.menu[menu_key].title = f"   {label}: {pct:.1f}%" + (f"  ↺{reset}" if reset else "")
+                self.menu[menu_key].hidden = False
+            else:
+                self.menu[menu_key].hidden = True
+
+        # Extra credits
+        eu = usage.get("extra_used")
+        el = usage.get("extra_limit")
+        extra_pct = usage.get("extra_pct")
+        if eu is not None and el:
+            eu_usd = eu / CREDITS_PER_DOLLAR
+            el_usd = el / CREDITS_PER_DOLLAR
+            warn = "⚠️ " if extra_pct and extra_pct >= 90 else ""
+            self.menu["   extra_credits"].title = (
+                f"   {warn}Extra: ${eu_usd:.2f}/${el_usd:.2f} ({extra_pct:.0f}%)"
+            )
+            self.menu["   extra_credits"].hidden = False
+        else:
+            self.menu["   extra_credits"].hidden = True
 
 
 # ─── Entry point ─────────────────────────────────────────────────────────────

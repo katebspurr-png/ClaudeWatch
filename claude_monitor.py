@@ -39,11 +39,23 @@ DEFAULT_CONFIG = {
     "show_weekly_pct":    True,
     "show_reset_time":    False,
     "show_hover_tooltip": True,
+    "notifications_enabled": True,
 }
 
 CREDITS_PER_DOLLAR = 100   # 1 credit = $0.01 (confirmed against billing)
-USAGE_THRESHOLDS   = [25, 50, 75, 90]  # % usage to notify at (session + weekly)
-EXTRA_THRESHOLDS   = [50, 75, 90, 95]  # % extra credits to notify at
+SESSION_THRESHOLDS = [75, 90]   # % session usage to notify at
+WEEKLY_THRESHOLDS  = [75, 90]   # % weekly usage to notify at
+EXTRA_THRESHOLDS   = [80, 95]   # % extra credits to notify at
+
+REFRESH_OPTIONS = [1, 5, 15, 30]  # minutes
+
+MODEL_DISPLAY = {
+    "claude-sonnet-4-6": "Sonnet 4.6",
+    "claude-opus-4-6":   "Opus 4.6",
+    "claude-haiku-4-5":  "Haiku 4.5",
+    "claude-sonnet-4-5": "Sonnet 4.5",
+    "claude-opus-4-5":   "Opus 4.5",
+}
 
 
 # ─── Cookie decryption ───────────────────────────────────────────────────────
@@ -86,30 +98,52 @@ def get_claude_cookies():
 
 # ─── Usage API ───────────────────────────────────────────────────────────────
 
+def _decode_response(resp):
+    """Decode API response, handling zstd compression."""
+    if resp.headers.get("Content-Encoding") == "zstd":
+        import zstandard
+        dctx = zstandard.ZstdDecompressor()
+        return json.loads(dctx.decompress(resp.content))
+    return resp.json()
+
+
+def _make_session(cookies):
+    """Create a requests.Session with full cookie jar and browser headers."""
+    s = requests.Session()
+    for name, value in cookies.items():
+        s.cookies.set(name, value, domain="claude.ai")
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/131.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://claude.ai/",
+        "Origin": "https://claude.ai",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"macOS"',
+        "anthropic-client-platform": "web_claude_ai",
+    })
+    return s
+
+
 def fetch_claude_usage():
     cookies = get_claude_cookies()
     org_id  = cookies.get("lastActiveOrg", "")
     if not org_id:
         raise RuntimeError("Could not determine org ID from cookies")
 
-    session = requests.Session()
-    session.cookies.update({
-        "sessionKey":          cookies.get("sessionKey", ""),
-        "lastActiveOrg":       org_id,
-        "anthropic-device-id": cookies.get("anthropic-device-id", ""),
-    })
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) Claude/1.0",
-        "Accept":   "application/json",
-        "Referer":  "https://claude.ai/",
-    })
+    session = _make_session(cookies)
 
     resp = session.get(
         f"https://claude.ai/api/organizations/{org_id}/usage", timeout=15
     )
     resp.raise_for_status()
-    data = resp.json()
+    data = _decode_response(resp)
 
     five_hour = data.get("five_hour")  or {}
     seven_day = data.get("seven_day")  or {}
@@ -136,6 +170,8 @@ def fetch_claude_usage():
         "extra_enabled":     extra.get("is_enabled", False),
         "extra_pct":         extra.get("utilization"),
         "per_model":         per_model,
+        "sonnet_pct": data["seven_day_sonnet"]["utilization"] if data.get("seven_day_sonnet") else None,
+        "opus_pct":   data["seven_day_opus"]["utilization"]   if data.get("seven_day_opus")   else None,
     }
 
 
@@ -724,6 +760,71 @@ def _fmt_reset(iso_str):
         return ""
 
 
+def _relative_time(iso_str):
+    """Convert ISO timestamp to relative time like '2h ago', 'yesterday', 'Mar 15'."""
+    if not iso_str:
+        return ""
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        diff = now - dt
+        secs = int(diff.total_seconds())
+        if secs < 60:
+            return "just now"
+        if secs < 3600:
+            return f"{secs // 60}m ago"
+        if secs < 86400:
+            return f"{secs // 3600}h ago"
+        if secs < 172800:
+            return "yesterday"
+        if secs < 604800:
+            return f"{secs // 86400}d ago"
+        return dt.strftime("%b %d")
+    except Exception:
+        return ""
+
+
+def _build_conversations_html(conversations):
+    """Generate styled HTML table of recent conversations."""
+    rows_html = ""
+    for c in conversations:
+        name = c.get("name", "Untitled") or "Untitled"
+        if len(name) > 60:
+            name = name[:57] + "…"
+        model_id = c.get("model", "")
+        model = MODEL_DISPLAY.get(model_id, model_id.replace("claude-", "").title())
+        project = (c.get("project") or {}).get("name", "—") or "—"
+        updated = _relative_time(c.get("updated_at", ""))
+        uuid = c.get("uuid", "")
+        link = f"https://claude.ai/chat/{uuid}"
+        rows_html += f"""<tr>
+            <td><a href="{link}" target="_blank">{name}</a></td>
+            <td>{model}</td>
+            <td>{project}</td>
+            <td>{updated}</td>
+        </tr>\n"""
+
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>ClaudeWatch — Recent Conversations</title>
+<style>
+body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+       margin: 2rem; background: #1a1a2e; color: #e0e0e0; }}
+h1 {{ color: #d4a574; font-size: 1.4rem; }}
+table {{ border-collapse: collapse; width: 100%; margin-top: 1rem; }}
+th {{ text-align: left; padding: 0.6rem 1rem; background: #16213e;
+     color: #d4a574; font-size: 0.85rem; text-transform: uppercase; }}
+td {{ padding: 0.6rem 1rem; border-bottom: 1px solid #2a2a4a; font-size: 0.9rem; }}
+tr:hover {{ background: #16213e; }}
+a {{ color: #7eb8da; text-decoration: none; }}
+a:hover {{ text-decoration: underline; }}
+</style></head><body>
+<h1>Recent Conversations</h1>
+<table>
+<thead><tr><th>Name</th><th>Model</th><th>Project</th><th>Updated</th></tr></thead>
+<tbody>{rows_html}</tbody>
+</table></body></html>"""
+
+
 def _build_title(usage, config):
     if usage is None:
         return "!"
@@ -737,6 +838,12 @@ def _build_title(usage, config):
         reset = _fmt_reset(usage.get("session_resets_at", ""))
         if reset:
             title += f"  ↺{reset}"
+    extra_pct = usage.get("extra_pct")
+    if extra_pct is not None and usage.get("extra_enabled"):
+        if extra_pct >= 95:
+            title += " 🚨"
+        elif extra_pct >= 80:
+            title += " ⚠️"
     return title
 
 
@@ -781,9 +888,8 @@ class ClaudeMonitorApp(rumps.App):
         self.config          = load_config()
         self._usage          = None
         self._stats          = None
-        self._warned_weekly  = set()   # weekly thresholds already notified
-        self._warned_session = set()   # session thresholds already notified
-        self._warned_extra   = set()   # extra credits thresholds already notified
+        self._notified = set()            # keys like "session_75", "weekly_90", "extra_80"
+        self._last_session_reset = None   # track session resets_at to clear session keys
 
         if DEPS_OK:
             init_db()
@@ -793,6 +899,7 @@ class ClaudeMonitorApp(rumps.App):
         self._s_weekly  = rumps.MenuItem("Weekly % (7d)",  callback=self._toggle("show_weekly_pct"))
         self._s_reset   = rumps.MenuItem("Reset time",     callback=self._toggle("show_reset_time"))
         self._s_tooltip = rumps.MenuItem("Hover tooltip",  callback=self._toggle("show_hover_tooltip"))
+        self._s_notif   = rumps.MenuItem("Notifications",  callback=self._toggle("notifications_enabled"))
         self._sync_checkmarks()
 
         settings = rumps.MenuItem("Settings")
@@ -803,6 +910,7 @@ class ClaudeMonitorApp(rumps.App):
             self._s_reset,
             None,
             self._s_tooltip,
+            self._s_notif,
         ])
 
         # Model guide submenu
@@ -839,29 +947,38 @@ class ClaudeMonitorApp(rumps.App):
         model_guide = rumps.MenuItem("Model Guide")
         model_guide.update([haiku, sonnet, opus])
 
+        # Refresh interval submenu
+        self._refresh_items = {}
+        refresh_menu = rumps.MenuItem("Refresh every…")
+        for mins in REFRESH_OPTIONS:
+            label = f"{mins} minute{'s' if mins > 1 else ''}"
+            item = rumps.MenuItem(label, callback=self._set_refresh(mins))
+            self._refresh_items[mins] = item
+            refresh_menu.add(item)
+        self._sync_refresh_checkmark()
+
         self.menu = [
-            rumps.MenuItem("Open Claude Usage",  callback=self.open_usage),
-            rumps.MenuItem("View Dashboard",     callback=self.open_dashboard),
+            rumps.MenuItem("Open Claude Usage",      callback=self.open_usage),
+            rumps.MenuItem("View Dashboard",         callback=self.open_dashboard),
+            rumps.MenuItem("Recent Conversations",   callback=self.open_conversations),
             None,
             rumps.MenuItem("⬤  Session (5h)",   callback=None),
             rumps.MenuItem("   —",               callback=None),
             rumps.MenuItem("⬤  Weekly (7d)",    callback=None),
             rumps.MenuItem("   —  ",             callback=None),
-            rumps.MenuItem("   per_model_opus",  callback=None),
-            rumps.MenuItem("   per_model_sonnet", callback=None),
-            rumps.MenuItem("   per_model_cowork", callback=None),
+            rumps.MenuItem("   per_model_line",  callback=None),
             rumps.MenuItem("   extra_credits",   callback=None),
             None,
             model_guide,
             settings,
+            refresh_menu,
             rumps.MenuItem("Refresh Now",        callback=self.manual_refresh),
             None,
             rumps.MenuItem("Quit",               callback=self.quit_app),
         ]
 
         # Hide per-model and extra items initially
-        for key in ("   per_model_opus", "   per_model_sonnet",
-                     "   per_model_cowork", "   extra_credits"):
+        for key in ("   per_model_line", "   extra_credits"):
             self.menu[key].hidden = True
 
         if DEPS_OK:
@@ -884,6 +1001,7 @@ class ClaudeMonitorApp(rumps.App):
         self._s_weekly.state  = int(bool(self.config.get("show_weekly_pct",    True)))
         self._s_reset.state   = int(bool(self.config.get("show_reset_time",    False)))
         self._s_tooltip.state = int(bool(self.config.get("show_hover_tooltip", True)))
+        self._s_notif.state   = int(bool(self.config.get("notifications_enabled", True)))
 
     # ── Tooltip ──
 
@@ -908,6 +1026,31 @@ class ClaudeMonitorApp(rumps.App):
             rumps.notification("ClaudeWatch", "No data yet", "Fetching usage now…")
             threading.Thread(target=self._refresh, daemon=True).start()
 
+    @rumps.clicked("Recent Conversations")
+    def open_conversations(self, sender):
+        sender.title = "Loading..."
+        threading.Thread(target=self._fetch_conversations, args=(sender,), daemon=True).start()
+
+    def _fetch_conversations(self, sender):
+        try:
+            cookies = get_claude_cookies()
+            org_id = cookies.get("lastActiveOrg", "")
+            session = _make_session(cookies)
+            resp = session.get(
+                f"https://claude.ai/api/organizations/{org_id}/chat_conversations?limit=20",
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = _decode_response(resp)
+            html = _build_conversations_html(data)
+            path = CONFIG_DIR / "conversations.html"
+            path.write_text(html)
+            webbrowser.open(f"file://{path}")
+        except Exception as e:
+            rumps.notification("ClaudeWatch", "Error loading conversations", str(e)[:100])
+        finally:
+            sender.title = "Recent Conversations"
+
     @rumps.clicked("Refresh Now")
     def manual_refresh(self, _):
         threading.Thread(target=self._refresh, daemon=True).start()
@@ -916,14 +1059,33 @@ class ClaudeMonitorApp(rumps.App):
     def quit_app(self, _):
         rumps.quit_application()
 
-    # ── Refresh ──
+    # ── Refresh interval ──
+
+    def _set_refresh(self, minutes):
+        def callback(_):
+            self.config["refresh_interval_minutes"] = minutes
+            save_config(self.config)
+            self._sync_refresh_checkmark()
+            self._restart_timer()
+        return callback
+
+    def _sync_refresh_checkmark(self):
+        current = self.config.get("refresh_interval_minutes", 5)
+        for mins, item in self._refresh_items.items():
+            item.state = int(mins == current)
+
+    def _restart_timer(self):
+        if hasattr(self, "_timer") and self._timer:
+            self._timer.stop()
+        interval = self.config.get("refresh_interval_minutes", 5) * 60
+        self._timer = rumps.Timer(self._on_timer, interval)
+        self._timer.start()
+
+    def _on_timer(self, _):
+        self._refresh()
 
     def _start_timer(self):
-        interval = self.config.get("refresh_interval_minutes", 5) * 60
-
-        @rumps.timer(interval)
-        def _auto(timer):
-            self._refresh()
+        self._restart_timer()
 
     def _refresh(self):
         try:
@@ -938,66 +1100,44 @@ class ClaudeMonitorApp(rumps.App):
             self._apply_ui(None, error=str(e))
 
     def _check_limits(self, usage):
-        wpct   = usage["weekly_pct"]
+        if not self.config.get("notifications_enabled", True):
+            return
+
         spct   = usage["session_pct"]
-        wreset = usage.get("weekly_resets_at", "")
+        wpct   = usage["weekly_pct"]
         sreset = usage.get("session_resets_at", "")
 
-        # Reset warned sets when periods change
-        try:
-            reset_dt  = datetime.fromisoformat(wreset.replace("Z", "+00:00"))
-            period_id = reset_dt.strftime("%Y-%W")
-            if getattr(self, "_warned_period", None) != period_id:
-                self._warned_weekly = set()
-                self._warned_extra  = set()
-                self._warned_period = period_id
-        except Exception:
-            pass
+        # Reset session keys when session resets_at changes
+        if sreset != self._last_session_reset:
+            self._notified = {k for k in self._notified if not k.startswith("session_")}
+            self._last_session_reset = sreset
 
-        try:
-            sreset_dt  = datetime.fromisoformat(sreset.replace("Z", "+00:00"))
-            session_id = sreset_dt.isoformat()
-            if getattr(self, "_warned_session_id", None) != session_id:
-                self._warned_session = set()
-                self._warned_session_id = session_id
-        except Exception:
-            pass
+        sr = _fmt_reset(sreset)
+        wr = _fmt_reset(usage.get("weekly_resets_at", ""))
 
-        # Weekly usage notifications
-        for threshold in USAGE_THRESHOLDS:
-            if wpct >= threshold and threshold not in self._warned_weekly:
-                self._warned_weekly.add(threshold)
-                wr = _fmt_reset(wreset)
-                rumps.notification(
-                    f"ClaudeWatch — {threshold}% Weekly Usage",
-                    f"You've used {wpct:.0f}% of your weekly limit",
-                    f"Resets in {wr}." if wr else "",
-                )
+        for t in SESSION_THRESHOLDS:
+            key = f"session_{t}"
+            if spct >= t and key not in self._notified:
+                self._notified.add(key)
+                rumps.notification("ClaudeWatch", f"Session usage at {t}%",
+                                   f"Resets in {sr}." if sr else "")
 
-        # Session usage notifications
-        for threshold in USAGE_THRESHOLDS:
-            if spct >= threshold and threshold not in self._warned_session:
-                self._warned_session.add(threshold)
-                sr = _fmt_reset(sreset)
-                rumps.notification(
-                    f"ClaudeWatch — {threshold}% Session Usage",
-                    f"5-hour session at {spct:.0f}%",
-                    f"Resets in {sr}." if sr else "",
-                )
+        for t in WEEKLY_THRESHOLDS:
+            key = f"weekly_{t}"
+            if wpct >= t and key not in self._notified:
+                self._notified.add(key)
+                rumps.notification("ClaudeWatch", f"Weekly usage at {t}%",
+                                   f"Resets in {wr}." if wr else "")
 
-        # Extra credits notifications
         extra_pct = usage.get("extra_pct")
         if extra_pct is not None:
-            for threshold in EXTRA_THRESHOLDS:
-                if extra_pct >= threshold and threshold not in self._warned_extra:
-                    self._warned_extra.add(threshold)
-                    eu = usage.get("extra_used", 0)
-                    el = usage.get("extra_limit", 0)
-                    rumps.notification(
-                        f"ClaudeWatch — Extra Credits {threshold}%",
-                        f"${eu/CREDITS_PER_DOLLAR:.2f} of ${el/CREDITS_PER_DOLLAR:.2f} used",
-                        "Approaching monthly extra usage cap!" if threshold >= 90 else "",
-                    )
+            eu = usage.get("extra_used", 0)
+            for t in EXTRA_THRESHOLDS:
+                key = f"extra_{t}"
+                if extra_pct >= t and key not in self._notified:
+                    self._notified.add(key)
+                    rumps.notification("ClaudeWatch", f"Extra credits at {t}%",
+                                       f"{eu:.0f} credits used")
 
     def _apply_ui(self, usage, error=None):
         session_header = "⬤  Session (5h)"
@@ -1032,18 +1172,18 @@ class ClaudeMonitorApp(rumps.App):
         else:
             self.menu[weekly_detail].title = "   —  "
 
-        # Per-model breakdowns
+        # Per-model breakdowns (combined sub-line in weekly section)
         per_model = usage.get("per_model", {})
-        model_keys = {"Opus": "   per_model_opus", "Sonnet": "   per_model_sonnet",
-                      "Cowork": "   per_model_cowork"}
-        for label, menu_key in model_keys.items():
-            if label in per_model:
-                pct = per_model[label]["utilization"]
-                reset = _fmt_reset(per_model[label].get("resets_at", ""))
-                self.menu[menu_key].title = f"   {label}: {pct:.1f}%" + (f"  ↺{reset}" if reset else "")
-                self.menu[menu_key].hidden = False
-            else:
-                self.menu[menu_key].hidden = True
+        parts = []
+        if "Sonnet" in per_model:
+            parts.append(f"Sonnet: {per_model['Sonnet']['utilization']:.1f}%")
+        if "Opus" in per_model:
+            parts.append(f"Opus: {per_model['Opus']['utilization']:.1f}%")
+        if parts:
+            self.menu["   per_model_line"].title = "   " + "  ·  ".join(parts)
+            self.menu["   per_model_line"].hidden = False
+        else:
+            self.menu["   per_model_line"].hidden = True
 
         # Extra credits
         eu = usage.get("extra_used")

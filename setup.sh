@@ -43,8 +43,8 @@ echo "✅ Virtual environment created"
 echo ""
 echo "📦 Installing dependencies..."
 "$VENV_DIR/bin/pip" install --upgrade pip --quiet
-"$VENV_DIR/bin/pip" install rumps requests pycryptodome --quiet
-echo "✅ Dependencies installed (rumps, requests, pycryptodome)"
+"$VENV_DIR/bin/pip" install rumps requests pycryptodome zstandard --quiet
+echo "✅ Dependencies installed (rumps, requests, pycryptodome, zstandard)"
 
 # Copy Claude tray icon (used for the menu bar icon)
 CLAUDE_APP="/Applications/Claude.app/Contents/Resources"

@@ -22,6 +22,12 @@ try:
 except ImportError:
     DEPS_OK = False
 
+try:
+    import zstandard
+    ZSTD_OK = True
+except ImportError:
+    ZSTD_OK = False
+
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 CONFIG_DIR  = Path.home() / ".claude_monitor"
@@ -101,7 +107,11 @@ def get_claude_cookies():
 def _decode_response(resp):
     """Decode API response, handling zstd compression."""
     if resp.headers.get("Content-Encoding") == "zstd":
-        import zstandard
+        if not ZSTD_OK:
+            raise RuntimeError(
+                "Server sent zstd response but zstandard is not installed. "
+                "Run: pip install zstandard"
+            )
         dctx = zstandard.ZstdDecompressor()
         return json.loads(dctx.decompress(resp.content))
     return resp.json()
@@ -117,6 +127,7 @@ def _make_session(cookies):
                       "AppleWebKit/537.36 (KHTML, like Gecko) "
                       "Chrome/131.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
+        "Accept-Encoding": "gzip, deflate" if not ZSTD_OK else "gzip, deflate, zstd",
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": "https://claude.ai/",
         "Origin": "https://claude.ai",

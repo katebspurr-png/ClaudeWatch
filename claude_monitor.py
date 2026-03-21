@@ -360,6 +360,80 @@ def _tip(usage, stats):
     return "You're on track. Keep using the right model for the job: Haiku for quick tasks, Sonnet for most work, Opus for deep reasoning."
 
 
+# ─── Model Guide (context-aware) ─────────────────────────────────────────────
+
+def _model_guide_html(usage, stats):
+    wpct = usage["weekly_pct"]
+    days_left = stats["days_until_reset"] if stats else None
+
+    # Decide which model to recommend
+    if wpct >= 80:
+        rec = "haiku"
+        reason = "You're above 80% weekly usage — stick to Haiku for lighter tasks to stretch your remaining credits."
+    elif wpct >= 60:
+        rec = "sonnet"
+        reason = "Usage is moderate. Sonnet covers most tasks well — save Opus for problems that truly need it."
+    elif days_left is not None and days_left < 2 and wpct < 30:
+        rec = "opus"
+        reason = "Plenty of credits left with the reset around the corner — great time to tackle complex work with Opus."
+    elif stats and stats.get("hits_limit"):
+        rec = "haiku"
+        reason = "At your current burn rate you'll hit the limit before reset — conserve with Haiku where you can."
+    else:
+        rec = "sonnet"
+        reason = "You're on track. Sonnet is the best default — upgrade to Opus only when you need deep reasoning."
+
+    models = [
+        ("haiku", "Haiku", "Fast & light", [
+            "Quick Q&A and lookups",
+            "Summarisation & translation",
+            "Simple edits & rewrites",
+            "High-volume / repetitive tasks",
+        ]),
+        ("sonnet", "Sonnet", "Best all-rounder", [
+            "Coding & debugging",
+            "Writing & long-form editing",
+            "Data analysis & research",
+            "Most everyday tasks",
+        ]),
+        ("opus", "Opus", "Deep reasoning", [
+            "Hard math & logic problems",
+            "Multi-step planning",
+            "Architecture & system design",
+            "Novel / open-ended problems",
+        ]),
+    ]
+
+    cards = ""
+    for key, name, subtitle, tasks in models:
+        is_rec = key == rec
+        border = "border:2px solid var(--accent)" if is_rec else "border:1px solid var(--border)"
+        badge = '<span style="background:var(--accent);color:#fff;font-size:.65rem;padding:2px 8px;border-radius:99px;margin-left:8px;vertical-align:middle">RECOMMENDED</span>' if is_rec else ""
+        task_list = "".join(f"<li>{t}</li>" for t in tasks)
+        cards += f"""
+        <div class="model-card" style="{border}">
+          <div class="model-name">{name}{badge}</div>
+          <div class="model-sub">{subtitle}</div>
+          <ul class="model-tasks">{task_list}</ul>
+        </div>"""
+
+    return f"""
+    <div class="card" style="margin-top:16px">
+      <h2>Model Guide — Right Tool for the Job</h2>
+      <p style="font-size:.85rem;color:var(--muted);margin-bottom:14px">{reason}</p>
+      <div class="model-grid">{cards}</div>
+    </div>
+    <style>
+      .model-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}}
+      @media(max-width:500px){{.model-grid{{grid-template-columns:1fr}}}}
+      .model-card{{background:var(--surface);border-radius:var(--radius);padding:14px}}
+      .model-name{{font-size:.95rem;font-weight:700;margin-bottom:2px}}
+      .model-sub{{font-size:.75rem;color:var(--muted);margin-bottom:10px}}
+      .model-tasks{{font-size:.8rem;padding-left:18px;line-height:1.7;color:var(--text)}}
+      .model-tasks li{{margin-bottom:2px}}
+    </style>"""
+
+
 # ─── Dashboard HTML ──────────────────────────────────────────────────────────
 
 def generate_dashboard(usage, stats):
@@ -604,6 +678,7 @@ def generate_dashboard(usage, stats):
 {extra_html}
 {chart_html}
 {pattern_html}
+{_model_guide_html(usage, stats)}
 
 <div class="footer">ClaudeWatch · data from Claude desktop app · <a href="{CLAUDE_USAGE_URL}" style="color:var(--accent)">open claude.ai</a></div>
 </body>

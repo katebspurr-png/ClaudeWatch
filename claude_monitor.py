@@ -458,21 +458,161 @@ def _model_guide_html(usage, stats):
       <h2>Model Guide — Right Tool for the Job</h2>
       <p style="font-size:.85rem;color:var(--muted);margin-bottom:14px">{reason}</p>
       <div class="model-grid">{cards}</div>
-    </div>
-    <style>
-      .model-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}}
-      @media(max-width:500px){{.model-grid{{grid-template-columns:1fr}}}}
-      .model-card{{background:var(--surface);border-radius:var(--radius);padding:14px}}
-      .model-name{{font-size:.95rem;font-weight:700;margin-bottom:2px}}
-      .model-sub{{font-size:.75rem;color:var(--muted);margin-bottom:10px}}
-      .model-tasks{{font-size:.8rem;padding-left:18px;line-height:1.7;color:var(--text)}}
-      .model-tasks li{{margin-bottom:2px}}
-    </style>"""
+    </div>"""
+
+
+def _per_model_html(usage):
+    """Render per-model usage bars (Max plan only). Returns '' if no data."""
+    pm = usage.get("per_model")
+    if not pm:
+        return ""
+    rows = ""
+    for name, info in sorted(pm.items()):
+        pct = info.get("utilization", 0)
+        reset = _fmt_reset(info.get("resets_at", ""))
+        if pct >= 85:
+            color = "#ef4444"
+        elif pct >= 60:
+            color = "#f59e0b"
+        else:
+            color = "#D97757"
+        rows += f"""
+        <div style="margin-bottom:12px">
+          <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px">
+            <span style="font-weight:600">{name}</span>
+            <span style="font-size:1.1rem;font-weight:700;color:{color}">{pct:.0f}%</span>
+          </div>
+          <div class="bar-wrap"><div class="bar" style="width:{min(pct,100):.1f}%;background:{color}"></div></div>
+          {f'<div class="reset-badge">resets in {reset}</div>' if reset else ''}
+        </div>"""
+    return f"""
+    <div class="card">
+      <h2>Per-Model Usage (7d)</h2>
+      {rows}
+    </div>"""
+
+
+def load_session_history():
+    """Return recent session data points with reset boundaries from DB."""
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        rows = conn.execute(
+            "SELECT ts, session_pct, session_resets_at "
+            "FROM usage_log ORDER BY ts DESC LIMIT 200"
+        ).fetchall()
+    finally:
+        conn.close()
+    return list(reversed(rows))
+
+
+def _detect_sessions(rows):
+    """Detect session boundaries and return summaries of recent sessions."""
+    if not rows:
+        return []
+    sessions = []
+    current_reset = rows[0][2]
+    session_start = rows[0][0]
+    peak_pct = rows[0][1]
+
+    for ts, pct, reset_at in rows[1:]:
+        if reset_at != current_reset:
+            sessions.append({
+                "start": session_start,
+                "peak_pct": peak_pct,
+            })
+            current_reset = reset_at
+            session_start = ts
+            peak_pct = pct
+        else:
+            peak_pct = max(peak_pct, pct)
+
+    # Add the current (ongoing) session
+    sessions.append({
+        "start": session_start,
+        "peak_pct": peak_pct,
+    })
+
+    return sessions[-10:]  # last 10 sessions
+
+
+def _session_history_html(sessions):
+    """Render a compact session history log."""
+    if not sessions or len(sessions) < 2:
+        return """
+        <div class="card muted">
+          <h2>Recent Sessions</h2>
+          <p>Session history will appear after a few session resets.</p>
+        </div>"""
+
+    rows = ""
+    for s in reversed(sessions):
+        pct = s["peak_pct"]
+        if pct >= 80:
+            dot_color = "#ef4444"
+        elif pct >= 50:
+            dot_color = "#f59e0b"
+        else:
+            dot_color = "#22c55e"
+        try:
+            ts = datetime.fromisoformat(s["start"])
+            time_str = _relative_time(s["start"])
+        except Exception:
+            time_str = s["start"][:16]
+        rows += f"""
+        <div class="session-row">
+          <div class="session-dot" style="background:{dot_color}"></div>
+          <div style="flex:1;font-size:.85rem">{time_str}</div>
+          <div style="font-weight:600;font-size:.9rem;color:{dot_color}">{pct:.0f}%</div>
+          <div style="font-size:.75rem;color:var(--muted);width:60px;text-align:right">peak</div>
+        </div>"""
+    return f"""
+    <div class="card">
+      <h2>Recent Sessions</h2>
+      {rows}
+    </div>"""
+
+
+def _conversations_dashboard_html(conversations):
+    """Render recent conversations as an embedded dashboard table."""
+    if not conversations:
+        return """
+        <div class="card muted">
+          <h2>Recent Conversations</h2>
+          <p>Conversation data will appear on next refresh.</p>
+        </div>"""
+
+    rows_html = ""
+    for c in conversations[:10]:
+        name = c.get("name") or "Untitled"
+        if len(name) > 60:
+            name = name[:57] + "…"
+        uuid = c.get("uuid", "")
+        model_id = c.get("model") or ""
+        model = MODEL_DISPLAY.get(model_id, model_id.split("-")[-1].title() if model_id else "—")
+        project = (c.get("project") or {}).get("name") or "—"
+        updated = _relative_time(c.get("updated_at", ""))
+        link = f"https://claude.ai/chat/{uuid}" if uuid else "#"
+        rows_html += f"""
+        <tr>
+          <td><a href="{link}" target="_blank">{name}</a></td>
+          <td>{model}</td>
+          <td>{project}</td>
+          <td>{updated}</td>
+        </tr>"""
+
+    return f"""
+    <div class="card">
+      <h2>Recent Conversations</h2>
+      <table class="conv-table">
+        <thead><tr><th>Name</th><th>Model</th><th>Project</th><th>Updated</th></tr></thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+    </div>"""
 
 
 # ─── Dashboard HTML ──────────────────────────────────────────────────────────
 
-def generate_dashboard(usage, stats):
+def generate_dashboard(usage, stats, conversations=None):
     spct     = usage["session_pct"]
     wpct     = usage["weekly_pct"]
     sreset   = _fmt_reset(usage.get("session_resets_at", ""))
@@ -515,7 +655,7 @@ def generate_dashboard(usage, stats):
           <canvas id="chart" height="90"></canvas>
         </div>
         <script>
-        new Chart(document.getElementById('chart'), {{
+        try {{ new Chart(document.getElementById('chart'), {{
           type: 'line',
           data: {{
             labels: {chart_labels},
@@ -537,7 +677,7 @@ def generate_dashboard(usage, stats):
               x: {{ ticks: {{ maxTicksLimit: 8 }} }}
             }}
           }}
-        }});
+        }}); }} catch(e) {{ console.warn('Chart error:', e); }}
         </script>"""
     else:
         chart_html = """
@@ -576,7 +716,7 @@ def generate_dashboard(usage, stats):
           </p>
         </div>
         <script>
-        new Chart(document.getElementById('dowchart'), {{
+        try {{ new Chart(document.getElementById('dowchart'), {{
           type: 'bar',
           data: {{
             labels: {dow_labels},
@@ -593,7 +733,7 @@ def generate_dashboard(usage, stats):
               x: {{ grid: {{ display: false }} }}
             }}
           }}
-        }});
+        }}); }} catch(e) {{ console.warn('Chart error:', e); }}
         </script>"""
     else:
         days_needed = 7 - (len(patterns) if patterns else 0)
@@ -620,6 +760,14 @@ def generate_dashboard(usage, stats):
             <span>{epct:.1f}% used</span><span>${el_usd:.2f} max</span>
           </div>
         </div>"""
+
+    per_model_html = _per_model_html(usage)
+
+    session_rows = load_session_history()
+    sessions = _detect_sessions(session_rows)
+    session_html = _session_history_html(sessions)
+
+    conversations_html = _conversations_dashboard_html(conversations)
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -664,6 +812,22 @@ def generate_dashboard(usage, stats):
   .muted p{{color:var(--muted);font-size:.9rem;padding:12px 0}}
   .footer{{text-align:center;font-size:.75rem;color:var(--muted);margin-top:24px}}
   .reset-badge{{font-size:.75rem;color:var(--muted);margin-top:4px}}
+  .model-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}}
+  @media(max-width:500px){{.model-grid{{grid-template-columns:1fr}}}}
+  .model-card{{background:var(--surface);border-radius:var(--radius);padding:14px}}
+  .model-name{{font-size:.95rem;font-weight:700;margin-bottom:2px}}
+  .model-sub{{font-size:.75rem;color:var(--muted);margin-bottom:10px}}
+  .model-tasks{{font-size:.8rem;padding-left:18px;line-height:1.7;color:var(--text)}}
+  .model-tasks li{{margin-bottom:2px}}
+  .session-row{{display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border)}}
+  .session-row:last-child{{border-bottom:none}}
+  .session-dot{{width:8px;height:8px;border-radius:50%;flex-shrink:0}}
+  .conv-table{{width:100%;border-collapse:collapse;font-size:.85rem}}
+  .conv-table th{{text-align:left;color:var(--muted);font-weight:600;padding:8px 6px;border-bottom:2px solid var(--border)}}
+  .conv-table td{{padding:8px 6px;border-bottom:1px solid var(--border)}}
+  .conv-table tr:hover td{{background:rgba(217,119,87,0.05)}}
+  .conv-table a{{color:var(--accent);text-decoration:none}}
+  .conv-table a:hover{{text-decoration:underline}}
 </style>
 </head>
 <body>
@@ -712,8 +876,11 @@ def generate_dashboard(usage, stats):
 </div>
 
 {extra_html}
+{per_model_html}
+{session_html}
 {chart_html}
 {pattern_html}
+{conversations_html}
 {_model_guide_html(usage, stats)}
 
 <div class="footer">ClaudeWatch · data from Claude desktop app · <a href="{CLAUDE_USAGE_URL}" style="color:var(--accent)">open claude.ai</a></div>
@@ -888,6 +1055,7 @@ class ClaudeMonitorApp(rumps.App):
         self.config          = load_config()
         self._usage          = None
         self._stats          = None
+        self._conversations  = None
         self._notified = set()            # keys like "session_75", "weekly_90", "extra_80"
         self._last_session_reset = None   # track session resets_at to clear session keys
 
@@ -1020,7 +1188,7 @@ class ClaudeMonitorApp(rumps.App):
     @rumps.clicked("View Dashboard")
     def open_dashboard(self, _):
         if self._usage:
-            path = generate_dashboard(self._usage, self._stats)
+            path = generate_dashboard(self._usage, self._stats, getattr(self, "_conversations", None))
             webbrowser.open(f"file://{path}")
         else:
             rumps.notification("ClaudeWatch", "No data yet", "Fetching usage now…")
@@ -1033,15 +1201,7 @@ class ClaudeMonitorApp(rumps.App):
 
     def _fetch_conversations(self, sender):
         try:
-            cookies = get_claude_cookies()
-            org_id = cookies.get("lastActiveOrg", "")
-            session = _make_session(cookies)
-            resp = session.get(
-                f"https://claude.ai/api/organizations/{org_id}/chat_conversations?limit=20",
-                timeout=15,
-            )
-            resp.raise_for_status()
-            data = _decode_response(resp)
+            data = self._fetch_conversations_data()
             html = _build_conversations_html(data)
             path = CONFIG_DIR / "conversations.html"
             path.write_text(html)
@@ -1087,6 +1247,18 @@ class ClaudeMonitorApp(rumps.App):
     def _start_timer(self):
         self._restart_timer()
 
+    def _fetch_conversations_data(self):
+        """Fetch conversation list from Claude API. Returns list or None."""
+        cookies = get_claude_cookies()
+        org_id = cookies.get("lastActiveOrg", "")
+        session = _make_session(cookies)
+        resp = session.get(
+            f"https://claude.ai/api/organizations/{org_id}/chat_conversations?limit=20",
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return _decode_response(resp)
+
     def _refresh(self):
         try:
             usage        = fetch_claude_usage()
@@ -1094,6 +1266,10 @@ class ClaudeMonitorApp(rumps.App):
             log_usage(usage)
             rows         = load_history()
             self._stats  = calculate_stats(usage, rows)
+            try:
+                self._conversations = self._fetch_conversations_data()
+            except Exception:
+                self._conversations = None
             self._apply_ui(usage)
             self._check_limits(usage)
         except Exception as e:

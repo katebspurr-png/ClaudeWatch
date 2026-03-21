@@ -694,7 +694,21 @@ class ClaudeMonitorApp(rumps.App):
         self._s_weekly  = rumps.MenuItem("Weekly % (7d)",  callback=self._toggle("show_weekly_pct"))
         self._s_reset   = rumps.MenuItem("Reset time",     callback=self._toggle("show_reset_time"))
         self._s_tooltip = rumps.MenuItem("Hover tooltip",  callback=self._toggle("show_hover_tooltip"))
+
+        # Refresh interval submenu items
+        self._interval_items = {}
+        for m in [1, 5, 10, 15, 30, 60]:
+            self._interval_items[m] = rumps.MenuItem(f"{m} min", callback=self._set_interval(m))
+        self._interval_custom = rumps.MenuItem("Custom…", callback=self._set_custom_interval)
+
         self._sync_checkmarks()
+
+        interval_menu = rumps.MenuItem("Refresh interval")
+        interval_menu.update([
+            *self._interval_items.values(),
+            None,
+            self._interval_custom,
+        ])
 
         settings = rumps.MenuItem("Settings")
         settings.update([
@@ -704,6 +718,8 @@ class ClaudeMonitorApp(rumps.App):
             self._s_reset,
             None,
             self._s_tooltip,
+            None,
+            interval_menu,
         ])
 
         # Model guide submenu
@@ -776,6 +792,38 @@ class ClaudeMonitorApp(rumps.App):
         self._s_weekly.state  = int(bool(self.config.get("show_weekly_pct",    True)))
         self._s_reset.state   = int(bool(self.config.get("show_reset_time",    False)))
         self._s_tooltip.state = int(bool(self.config.get("show_hover_tooltip", True)))
+        current = self.config.get("refresh_interval_minutes", 5)
+        for m, item in self._interval_items.items():
+            item.state = int(m == current)
+        self._interval_custom.state = int(current not in self._interval_items)
+
+    def _set_interval(self, minutes):
+        def callback(_):
+            self.config["refresh_interval_minutes"] = minutes
+            save_config(self.config)
+            self._sync_checkmarks()
+            self._restart_timer()
+        return callback
+
+    def _set_custom_interval(self, _):
+        window = rumps.Window(
+            message="Enter refresh interval (minutes):",
+            title="Custom Refresh Interval",
+            default_text=str(self.config.get("refresh_interval_minutes", 5)),
+            ok="Set",
+            cancel="Cancel",
+            dimensions=(200, 24),
+        )
+        response = window.run()
+        if response.clicked:
+            try:
+                minutes = max(1, int(response.text.strip()))
+                self.config["refresh_interval_minutes"] = minutes
+                save_config(self.config)
+                self._sync_checkmarks()
+                self._restart_timer()
+            except ValueError:
+                pass
 
     # ── Tooltip ──
 
@@ -789,13 +837,13 @@ class ClaudeMonitorApp(rumps.App):
 
     @rumps.clicked("Open Claude Usage")
     def open_usage(self, _):
-        webbrowser.open(CLAUDE_USAGE_URL)
+        subprocess.run(["open", CLAUDE_USAGE_URL])
 
     @rumps.clicked("View Dashboard")
     def open_dashboard(self, _):
         if self._usage:
             path = generate_dashboard(self._usage, self._stats)
-            webbrowser.open(f"file://{path}")
+            subprocess.run(["open", path])
         else:
             rumps.notification("ClaudeWatch", "No data yet", "Fetching usage now…")
             threading.Thread(target=self._refresh, daemon=True).start()
@@ -812,10 +860,13 @@ class ClaudeMonitorApp(rumps.App):
 
     def _start_timer(self):
         interval = self.config.get("refresh_interval_minutes", 5) * 60
+        self._timer = rumps.Timer(lambda _: self._refresh(), interval)
+        self._timer.start()
 
-        @rumps.timer(interval)
-        def _auto(timer):
-            self._refresh()
+    def _restart_timer(self):
+        if getattr(self, "_timer", None) is not None:
+            self._timer.stop()
+        self._start_timer()
 
     def _refresh(self):
         try:

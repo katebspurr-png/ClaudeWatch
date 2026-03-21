@@ -56,12 +56,47 @@ EXTRA_THRESHOLDS   = [80, 95]   # % extra credits to notify at
 REFRESH_OPTIONS = [1, 5, 15, 30]  # minutes
 
 MODEL_DISPLAY = {
-    "claude-sonnet-4-6": "Sonnet 4.6",
-    "claude-opus-4-6":   "Opus 4.6",
-    "claude-haiku-4-5":  "Haiku 4.5",
-    "claude-sonnet-4-5": "Sonnet 4.5",
-    "claude-opus-4-5":   "Opus 4.5",
+    "claude-sonnet-4-6":          "Sonnet 4.6",
+    "claude-opus-4-6":            "Opus 4.6",
+    "claude-haiku-4-5":           "Haiku 4.5",
+    "claude-sonnet-4-5":          "Sonnet 4.5",
+    "claude-opus-4-5":            "Opus 4.5",
+    # Versioned IDs sometimes returned by message-level API
+    "claude-sonnet-4-6-20250514": "Sonnet 4.6",
+    "claude-opus-4-6-20250514":   "Opus 4.6",
+    "claude-haiku-4-5-20251001":  "Haiku 4.5",
+    "claude-sonnet-4-5-20241022": "Sonnet 4.5",
+    "claude-opus-4-5-20250115":   "Opus 4.5",
+    # Older model IDs
+    "claude-3-5-sonnet-20241022": "Sonnet 3.5",
+    "claude-3-5-haiku-20241022":  "Haiku 3.5",
+    "claude-3-opus-20240229":     "Opus 3",
 }
+
+
+def _get_conversation_model(conv):
+    """
+    Extract the most accurate model from a conversation object.
+    The API 'model' field is often the org/project default, not what was
+    actually used. Check several fields in priority order.
+    """
+    # 1. Enriched actual model from last assistant message (set by _fetch_conversations_data)
+    model_id = conv.get("_actual_model") or ""
+    # 2. model_override — set when user explicitly picks a different model
+    if not model_id:
+        model_id = conv.get("model_override") or ""
+    # 3. settings.model or settings.preview_model
+    if not model_id:
+        settings = conv.get("settings") or {}
+        model_id = settings.get("model") or settings.get("preview_model") or ""
+    # 4. active_model — some API versions include this
+    if not model_id:
+        model_id = conv.get("active_model") or ""
+    # 5. Fall back to conversation-level default
+    if not model_id:
+        model_id = conv.get("model") or ""
+
+    return model_id, MODEL_DISPLAY.get(model_id, model_id.split("-")[-1].title() if model_id else "—")
 
 
 # ─── Cookie decryption ───────────────────────────────────────────────────────
@@ -782,10 +817,9 @@ def _conversations_dashboard_html(conversations):
     for c in conversations[:10]:
         name = c.get("name") or "Untitled"
         if len(name) > 60:
-            name = name[:57] + "…"
+            name = name[:57] + "..."
         uuid = c.get("uuid", "")
-        model_id = c.get("model") or ""
-        model = MODEL_DISPLAY.get(model_id, model_id.split("-")[-1].title() if model_id else "—")
+        _, model = _get_conversation_model(c)
         project = (c.get("project") or {}).get("name") or "—"
         updated = _relative_time(c.get("updated_at", ""))
         link = f"https://claude.ai/chat/{uuid}" if uuid else "#"
@@ -828,12 +862,11 @@ def _conversation_insights_html(conversations):
     ranked = []
     now = datetime.now(timezone.utc)
     for c in conversations[:20]:
-        model_id = c.get("model") or ""
+        model_id, model_label = _get_conversation_model(c)
         weight = MODEL_COST_WEIGHT.get(model_id, 1.0)
         name = c.get("name") or "Untitled"
         uuid = c.get("uuid", "")
         updated = c.get("updated_at", "")
-        model_label = MODEL_DISPLAY.get(model_id, model_id.split("-")[-1].title() if model_id else "?")
 
         # Estimate "size" from created_at vs updated_at span
         created = c.get("created_at", updated)
@@ -885,7 +918,7 @@ def _conversation_insights_html(conversations):
     # Model mix breakdown
     model_counts = {}
     for c in conversations[:20]:
-        m = MODEL_DISPLAY.get(c.get("model", ""), "Other")
+        _, m = _get_conversation_model(c)
         model_counts[m] = model_counts.get(m, 0) + 1
     total = sum(model_counts.values())
     mix_parts = " · ".join(f"{m}: {n}" for m, n in sorted(model_counts.items(), key=lambda x: -x[1]))
@@ -1461,9 +1494,8 @@ def _build_conversations_html(conversations):
     for c in conversations:
         name = c.get("name", "Untitled") or "Untitled"
         if len(name) > 60:
-            name = name[:57] + "…"
-        model_id = c.get("model", "")
-        model = MODEL_DISPLAY.get(model_id, model_id.replace("claude-", "").title())
+            name = name[:57] + "..."
+        _, model = _get_conversation_model(c)
         project = (c.get("project") or {}).get("name", "—") or "—"
         updated = _relative_time(c.get("updated_at", ""))
         uuid = c.get("uuid", "")
@@ -1808,7 +1840,7 @@ class ClaudeMonitorApp(rumps.App):
         self._restart_timer()
 
     def _fetch_conversations_data(self):
-        """Fetch conversation list from Claude API. Returns list or None."""
+        """Fetch conversation list from Claude API, enriched with actual model used."""
         cookies = get_claude_cookies()
         org_id = cookies.get("lastActiveOrg", "")
         session = _make_session(cookies)
@@ -1817,7 +1849,34 @@ class ClaudeMonitorApp(rumps.App):
             timeout=15,
         )
         resp.raise_for_status()
-        return _decode_response(resp)
+        conversations = _decode_response(resp)
+
+        # Enrich recent conversations with the actual model from their last message.
+        # The list endpoint often returns the org/project default model, not the one
+        # the user selected. We fetch detail for the 10 most recent to get accuracy.
+        for conv in (conversations or [])[:10]:
+            uuid = conv.get("uuid")
+            if not uuid:
+                continue
+            try:
+                detail_resp = session.get(
+                    f"https://claude.ai/api/organizations/{org_id}/chat_conversations/{uuid}?tree=True&rendering_mode=messages",
+                    timeout=10,
+                )
+                if detail_resp.status_code == 200:
+                    detail = _decode_response(detail_resp)
+                    # Look for model in the last assistant message
+                    msgs = detail.get("chat_messages") or []
+                    for msg in reversed(msgs):
+                        if msg.get("sender") == "assistant":
+                            actual_model = msg.get("model") or ""
+                            if actual_model:
+                                conv["_actual_model"] = actual_model
+                            break
+            except Exception:
+                continue  # Don't let enrichment failures break the list
+
+        return conversations
 
     def _refresh(self):
         try:

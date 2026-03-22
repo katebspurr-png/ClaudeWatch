@@ -1841,77 +1841,85 @@ class ClaudeMonitorApp(rumps.App):
 
     def _fetch_conversations_data(self):
         """Fetch conversation list from Claude API, enriched with actual model used."""
-        cookies = get_claude_cookies()
-        org_id = cookies.get("lastActiveOrg", "")
-        session = _make_session(cookies)
-        resp = session.get(
-            f"https://claude.ai/api/organizations/{org_id}/chat_conversations?limit=20",
-            timeout=15,
-        )
-        resp.raise_for_status()
-        conversations = _decode_response(resp)
-
-        # Enrich recent conversations with the actual model from their last message.
-        # The list endpoint often returns the org/project default model, not the one
-        # the user selected. We fetch detail for the 10 most recent to get accuracy.
         import json as _json
+        import traceback as _tb
         debug_log = CONFIG_DIR / "model_debug.json"
-        debug_info = {"list_keys_sample": list((conversations[0] if conversations else {}).keys())}
+        debug_info = {"stage": "init"}
 
-        for i, conv in enumerate((conversations or [])[:10]):
-            uuid = conv.get("uuid")
-            if not uuid:
-                continue
-            try:
-                detail_resp = session.get(
-                    f"https://claude.ai/api/organizations/{org_id}/chat_conversations/{uuid}?tree=True&rendering_mode=messages",
-                    timeout=10,
-                )
-                if detail_resp.status_code == 200:
-                    detail = _decode_response(detail_resp)
-                    # Debug: save first conversation's structure
-                    if i == 0:
+        try:
+            cookies = get_claude_cookies()
+            org_id = cookies.get("lastActiveOrg", "")
+            session = _make_session(cookies)
+            debug_info["stage"] = "fetching_list"
+            resp = session.get(
+                f"https://claude.ai/api/organizations/{org_id}/chat_conversations?limit=20",
+                timeout=15,
+            )
+            resp.raise_for_status()
+            conversations = _decode_response(resp)
+            debug_info["stage"] = "list_fetched"
+            debug_info["num_conversations"] = len(conversations) if conversations else 0
+
+            if conversations:
+                # Dump all keys from the first conversation in the list
+                first = conversations[0]
+                debug_info["list_keys"] = list(first.keys())
+                debug_info["list_model"] = first.get("model")
+                debug_info["list_model_override"] = first.get("model_override")
+                debug_info["list_settings"] = first.get("settings")
+                debug_info["list_active_model"] = first.get("active_model")
+                debug_info["list_name"] = first.get("name")
+
+                # Try fetching detail for the first conversation only
+                uuid = first.get("uuid")
+                if uuid:
+                    debug_info["stage"] = "fetching_detail"
+                    detail_resp = session.get(
+                        f"https://claude.ai/api/organizations/{org_id}/chat_conversations/{uuid}?tree=True&rendering_mode=messages",
+                        timeout=10,
+                    )
+                    debug_info["detail_status"] = detail_resp.status_code
+                    if detail_resp.status_code == 200:
+                        detail = _decode_response(detail_resp)
                         debug_info["detail_keys"] = list(detail.keys())
-                        msgs = detail.get("chat_messages") or []
-                        debug_info["num_messages"] = len(msgs)
-                        if msgs:
-                            last_asst = None
-                            for m in reversed(msgs):
-                                if m.get("sender") == "assistant":
-                                    last_asst = m
-                                    break
-                            if last_asst:
-                                debug_info["last_assistant_keys"] = list(last_asst.keys())
-                                debug_info["last_assistant_model"] = last_asst.get("model")
-                                debug_info["last_assistant_sender"] = last_asst.get("sender")
-                        # Also dump top-level model fields
                         debug_info["detail_model"] = detail.get("model")
                         debug_info["detail_model_override"] = detail.get("model_override")
                         debug_info["detail_settings"] = detail.get("settings")
                         debug_info["detail_active_model"] = detail.get("active_model")
-                        # Conv list item fields
-                        debug_info["list_model"] = conv.get("model")
-                        debug_info["list_model_override"] = conv.get("model_override")
-                        debug_info["list_settings"] = conv.get("settings")
 
-                    # Look for model in the last assistant message
-                    msgs = detail.get("chat_messages") or []
-                    for msg in reversed(msgs):
-                        if msg.get("sender") == "assistant":
-                            actual_model = msg.get("model") or ""
-                            if actual_model:
-                                conv["_actual_model"] = actual_model
-                            break
-            except Exception as exc:
-                debug_info[f"error_{i}"] = str(exc)
-                continue
+                        msgs = detail.get("chat_messages") or []
+                        debug_info["num_messages"] = len(msgs)
 
-        try:
-            debug_log.write_text(_json.dumps(debug_info, indent=2, default=str))
-        except Exception:
-            pass
+                        # Find last assistant message
+                        for msg in reversed(msgs):
+                            if msg.get("sender") == "assistant":
+                                debug_info["last_asst_keys"] = list(msg.keys())
+                                debug_info["last_asst_model"] = msg.get("model")
+                                # Also check for model in nested content
+                                debug_info["last_asst_content_type"] = type(msg.get("content")).__name__
+                                break
 
-        return conversations
+                        # Also check first assistant message
+                        for msg in msgs:
+                            if msg.get("sender") == "assistant":
+                                debug_info["first_asst_keys"] = list(msg.keys())
+                                debug_info["first_asst_model"] = msg.get("model")
+                                break
+                    else:
+                        debug_info["detail_body_preview"] = detail_resp.text[:500]
+
+            debug_info["stage"] = "done"
+            return conversations
+
+        except Exception as exc:
+            debug_info["error"] = str(exc)
+            debug_info["traceback"] = _tb.format_exc()
+            raise
+        finally:
+            try:
+                debug_log.write_text(_json.dumps(debug_info, indent=2, default=str))
+            except Exception:
+                pass
 
     def _refresh(self):
         try:

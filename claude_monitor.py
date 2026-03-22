@@ -1123,6 +1123,223 @@ def _power_user_dashboard_html(usage, stats, velocity, runway, msg_est):
     </div>"""
 
 
+_DASHBOARD_CUSTOMIZE_JS = """<script>
+(function() {
+  var STORE_KEY = 'claudewatch_dashboard_prefs';
+  function loadPrefs() {
+    try { return JSON.parse(localStorage.getItem(STORE_KEY)) || {}; }
+    catch(e) { return {}; }
+  }
+  function savePrefs(p) { localStorage.setItem(STORE_KEY, JSON.stringify(p)); }
+  var prefs = loadPrefs();
+
+  // ── Chart rendering ──
+  var charts = {};
+
+  function renderWeekly(type) {
+    if (!window._wLabels) return;
+    if (charts.weeklyChart) charts.weeklyChart.destroy();
+    var ctx = document.getElementById('weeklyChart');
+    if (!ctx) return;
+    var cfg;
+    if (type === 'pie') {
+      var colors = _wLabels.map(function(_, i) {
+        return 'hsl(' + (15 + i * Math.floor(340 / _wLabels.length)) + ',65%,55%)';
+      });
+      cfg = {
+        type: 'pie',
+        data: { labels: _wLabels, datasets: [{ data: _wValues, backgroundColor: colors }] },
+        options: { plugins: { legend: { display: true, position: 'bottom',
+          labels: { boxWidth: 8, font: { size: 10 } } } } }
+      };
+    } else {
+      cfg = {
+        type: type,
+        data: {
+          labels: _wLabels,
+          datasets: [{
+            label: 'Weekly %', data: _wValues,
+            borderColor: '#D97757',
+            backgroundColor: type === 'line' ? 'rgba(217,119,87,0.1)' : 'rgba(217,119,87,0.6)',
+            borderWidth: 2, pointRadius: type === 'line' ? 2 : 0,
+            fill: type === 'line', tension: 0.3,
+            borderRadius: type === 'bar' ? 4 : 0,
+          }]
+        },
+        options: {
+          plugins: { legend: { display: false } },
+          scales: {
+            y: { min: 0, max: 100, ticks: { callback: function(v) { return v + '%'; } } },
+            x: { ticks: { maxTicksLimit: 8 } }
+          }
+        }
+      };
+    }
+    charts.weeklyChart = new Chart(ctx, cfg);
+  }
+
+  function renderDow(type) {
+    if (!window._dowLabels) return;
+    if (charts.dowChart) charts.dowChart.destroy();
+    var ctx = document.getElementById('dowChart');
+    if (!ctx) return;
+    var cfg;
+    if (type === 'pie' || type === 'doughnut') {
+      cfg = {
+        type: type,
+        data: { labels: _dowLabels, datasets: [{ data: _dowValues, backgroundColor: _dowColors }] },
+        options: { plugins: { legend: { position: 'bottom',
+          labels: { boxWidth: 10, font: { size: 11 } } } } }
+      };
+    } else {
+      cfg = {
+        type: 'bar',
+        data: { labels: _dowLabels, datasets: [{ data: _dowValues, backgroundColor: _dowColors, borderRadius: 6 }] },
+        options: {
+          plugins: { legend: { display: false } },
+          scales: {
+            y: { min: 0, ticks: { callback: function(v) { return v + '%'; } } },
+            x: { grid: { display: false } }
+          }
+        }
+      };
+    }
+    charts.dowChart = new Chart(ctx, cfg);
+  }
+
+  // ── Chart type buttons ──
+  document.querySelectorAll('.chart-btns').forEach(function(group) {
+    var chartId = group.dataset.for;
+    var savedType = (prefs.chartTypes || {})[chartId];
+    group.querySelectorAll('button').forEach(function(btn) {
+      if (savedType && btn.dataset.type === savedType) {
+        var prev = group.querySelector('.active');
+        if (prev) prev.classList.remove('active');
+        btn.classList.add('active');
+      } else if (!savedType && btn === group.firstElementChild) {
+        btn.classList.add('active');
+      }
+      btn.addEventListener('click', function() {
+        group.querySelectorAll('button').forEach(function(b) { b.classList.remove('active'); });
+        btn.classList.add('active');
+        var type = btn.dataset.type;
+        if (!prefs.chartTypes) prefs.chartTypes = {};
+        prefs.chartTypes[chartId] = type;
+        savePrefs(prefs);
+        if (chartId === 'weeklyChart') renderWeekly(type);
+        else if (chartId === 'dowChart') renderDow(type);
+      });
+    });
+  });
+
+  // Initial chart render
+  var weeklyType = (prefs.chartTypes || {}).weeklyChart || 'line';
+  var dowType = (prefs.chartTypes || {}).dowChart || 'bar';
+  try { renderWeekly(weeklyType); } catch(e) { console.warn('Weekly chart error:', e); }
+  try { renderDow(dowType); } catch(e) { console.warn('DOW chart error:', e); }
+
+  // ── Customize panel ──
+  var SECTION_LABELS = {
+    'tip':'Tip', 'usage':'Usage Overview', 'stats':'Stats',
+    'suggestion':'Smart Suggestion', 'power-user':'Power User Analytics',
+    'extra':'Extra Credits', 'per-model':'Per-Model Breakdown',
+    'sessions':'Session History', 'weekly-chart':'Weekly Chart',
+    'day-pattern':'Day Patterns', 'timing':'Optimal Timing',
+    'conv-insights':'Conversation Insights', 'conversations':'Recent Conversations',
+    'model-guide':'Model Guide'
+  };
+
+  var container = document.getElementById('dashboard-sections');
+  var panel = document.getElementById('customize-panel');
+
+  // Apply saved order
+  var savedOrder = prefs.sectionOrder;
+  if (savedOrder && savedOrder.length) {
+    var existing = Array.from(container.querySelectorAll('.section')).map(function(s) { return s.dataset.id; });
+    existing.forEach(function(id) { if (savedOrder.indexOf(id) === -1) savedOrder.push(id); });
+    savedOrder.forEach(function(id) {
+      var el = container.querySelector('[data-id="' + id + '"]');
+      if (el) container.appendChild(el);
+    });
+  }
+
+  // Apply saved visibility
+  (prefs.hiddenSections || []).forEach(function(id) {
+    var el = container.querySelector('[data-id="' + id + '"]');
+    if (el) el.style.display = 'none';
+  });
+
+  window.toggleCustomize = function() {
+    panel.classList.toggle('hidden');
+    if (!panel.classList.contains('hidden')) buildPanel();
+  };
+
+  function buildPanel() {
+    var currentSections = Array.from(container.querySelectorAll('.section')).filter(function(s) { return s.dataset.id; });
+    var html = '<h3>Customize Dashboard</h3>'
+      + '<p style="font-size:.75rem;color:var(--muted);margin-bottom:10px">Drag to reorder. Toggle to show/hide.</p>'
+      + '<ul class="customize-list">';
+    currentSections.forEach(function(sec) {
+      var id = sec.dataset.id;
+      var label = SECTION_LABELS[id] || id;
+      var checked = sec.style.display !== 'none' ? 'checked' : '';
+      html += '<li draggable="true" data-id="' + id + '">'
+        + '<span class="grip">&#x2630;</span>'
+        + '<input type="checkbox" ' + checked + ' data-section="' + id + '">'
+        + '<span>' + label + '</span></li>';
+    });
+    html += '</ul>';
+    panel.innerHTML = html;
+
+    // Checkbox handlers
+    panel.querySelectorAll('input[type="checkbox"]').forEach(function(cb) {
+      cb.addEventListener('change', function() {
+        var id = cb.dataset.section;
+        var el = container.querySelector('[data-id="' + id + '"]');
+        if (el) el.style.display = cb.checked ? '' : 'none';
+        var h = (prefs.hiddenSections || []).slice();
+        if (cb.checked) h = h.filter(function(x) { return x !== id; });
+        else if (h.indexOf(id) === -1) h.push(id);
+        prefs.hiddenSections = h;
+        savePrefs(prefs);
+      });
+    });
+
+    // Drag-and-drop reordering in list
+    var list = panel.querySelector('.customize-list');
+    var dragItem = null;
+    list.querySelectorAll('li').forEach(function(li) {
+      li.addEventListener('dragstart', function(e) {
+        dragItem = li;
+        li.classList.add('dragging');
+        e.dataTransfer.effectAllowed = 'move';
+      });
+      li.addEventListener('dragend', function() {
+        li.classList.remove('dragging');
+        dragItem = null;
+        var newOrder = Array.from(list.querySelectorAll('li')).map(function(l) { return l.dataset.id; });
+        prefs.sectionOrder = newOrder;
+        savePrefs(prefs);
+        newOrder.forEach(function(id) {
+          var el = container.querySelector('[data-id="' + id + '"]');
+          if (el) container.appendChild(el);
+        });
+      });
+      li.addEventListener('dragover', function(e) {
+        e.preventDefault();
+        if (dragItem && dragItem !== li) {
+          var rect = li.getBoundingClientRect();
+          var mid = rect.top + rect.height / 2;
+          if (e.clientY < mid) list.insertBefore(dragItem, li);
+          else list.insertBefore(dragItem, li.nextSibling);
+        }
+      });
+    });
+  }
+})();
+</script>"""
+
+
 def generate_dashboard(usage, stats, conversations=None):
     spct     = usage["session_pct"]
     wpct     = usage["weekly_pct"]
@@ -1154,42 +1371,24 @@ def generate_dashboard(usage, stats, conversations=None):
         proj_str   = "Not enough data for projection yet"
         proj_color = "#6b7280"
 
-    # Chart data
+    # Chart data (rendered by JS for chart-type switching)
+    weekly_data_js = ""
     if stats and len(stats["chart_labels"]) > 1:
         chart_labels = json.dumps(
             [datetime.fromisoformat(l).strftime("%-I%p %-m/%-d") for l in stats["chart_labels"]]
         )
         chart_values = json.dumps(stats["chart_values"])
-        chart_html = f"""
+        weekly_data_js = f"var _wLabels={chart_labels},_wValues={chart_values};"
+        chart_html = """
         <div class="card">
-          <h2>Weekly Usage Over Time</h2>
-          <canvas id="chart" height="90"></canvas>
-        </div>
-        <script>
-        try {{ new Chart(document.getElementById('chart'), {{
-          type: 'line',
-          data: {{
-            labels: {chart_labels},
-            datasets: [{{
-              label: 'Weekly %',
-              data: {chart_values},
-              borderColor: '#D97757',
-              backgroundColor: 'rgba(217,119,87,0.1)',
-              borderWidth: 2,
-              pointRadius: 2,
-              fill: true,
-              tension: 0.3,
-            }}]
-          }},
-          options: {{
-            plugins: {{ legend: {{ display: false }} }},
-            scales: {{
-              y: {{ min: 0, max: 100, ticks: {{ callback: v => v + '%' }} }},
-              x: {{ ticks: {{ maxTicksLimit: 8 }} }}
-            }}
-          }}
-        }}); }} catch(e) {{ console.warn('Chart error:', e); }}
-        </script>"""
+          <div class="section-header"><h2>Weekly Usage Over Time</h2>
+          <div class="chart-btns" data-for="weeklyChart">
+            <button data-type="line">Line</button>
+            <button data-type="bar">Bar</button>
+            <button data-type="pie">Pie</button>
+          </div></div>
+          <canvas id="weeklyChart" height="90"></canvas>
+        </div>"""
     else:
         chart_html = """
         <div class="card muted">
@@ -1205,7 +1404,8 @@ def generate_dashboard(usage, stats, conversations=None):
     else:
         burn_str = budget_str = reset_str = "—"
 
-    # Day-of-week pattern chart
+    # Day-of-week pattern chart (rendered by JS for chart-type switching)
+    dow_data_js = ""
     patterns = stats.get("day_patterns") if stats else None
     if patterns and len(patterns) >= 5:
         today = datetime.now().weekday()
@@ -1218,34 +1418,20 @@ def generate_dashboard(usage, stats, conversations=None):
             for i in range(7)
         ])
         heaviest_day = DOW_NAMES[max(patterns, key=patterns.get)]
+        dow_data_js = f"var _dowLabels={dow_labels},_dowValues={dow_values},_dowColors={dow_colors};"
         pattern_html = f"""
         <div class="card">
-          <h2>Usage by Day of Week <span style="font-weight:400;color:var(--muted)">(avg % burned)</span></h2>
-          <canvas id="dowchart" height="80"></canvas>
+          <div class="section-header"><h2>Usage by Day of Week <span style="font-weight:400;color:var(--muted)">(avg % burned)</span></h2>
+          <div class="chart-btns" data-for="dowChart">
+            <button data-type="bar">Bar</button>
+            <button data-type="pie">Pie</button>
+            <button data-type="doughnut">Donut</button>
+          </div></div>
+          <canvas id="dowChart" height="80"></canvas>
           <p style="font-size:.8rem;color:var(--muted);margin-top:12px">
             Heaviest day: <b>{heaviest_day}</b> &nbsp;·&nbsp; Blue bar = today
           </p>
-        </div>
-        <script>
-        try {{ new Chart(document.getElementById('dowchart'), {{
-          type: 'bar',
-          data: {{
-            labels: {dow_labels},
-            datasets: [{{
-              data: {dow_values},
-              backgroundColor: {dow_colors},
-              borderRadius: 6,
-            }}]
-          }},
-          options: {{
-            plugins: {{ legend: {{ display: false }} }},
-            scales: {{
-              y: {{ min: 0, ticks: {{ callback: v => v + '%' }} }},
-              x: {{ grid: {{ display: false }} }}
-            }}
-          }}
-        }}); }} catch(e) {{ console.warn('Chart error:', e); }}
-        </script>"""
+        </div>"""
     else:
         days_needed = 7 - (len(patterns) if patterns else 0)
         pattern_html = f"""
@@ -1304,6 +1490,55 @@ def generate_dashboard(usage, stats, conversations=None):
     # Conversation insights and optimal timing
     conv_insights_html = _conversation_insights_html(conversations)
     timing_html = _optimal_timing_html(stats)
+
+    # Pre-build section wrappers for customizable layout
+    def _sec(data_id, content):
+        if not content or not content.strip():
+            return ""
+        return f'<div class="section" data-id="{data_id}">{content}</div>'
+
+    tip_sec = f'<div class="tip">{tip}</div>'
+
+    grid_sec = f"""<div class="grid">
+  <div class="card">
+    <h2>Session Usage (5h)</h2>
+    <div class="big">{spct:.0f}%</div>
+    <div class="bar-wrap"><div class="bar" style="width:{min(spct,100):.1f}%;background:#D97757"></div></div>
+    <div class="bar-labels"><span>used</span><span>100%</span></div>
+    <div class="reset-badge">{f"resets in {sreset}" if sreset else ""}</div>
+  </div>
+  <div class="card">
+    <h2>Weekly Usage (7d)</h2>
+    <div class="big" style="color:{w_color}">{wpct:.0f}%</div>
+    <div class="bar-wrap"><div class="bar" style="width:{min(wpct,100):.1f}%;background:{w_color}"></div></div>
+    <div class="bar-labels"><span>used</span><span>100%</span></div>
+    <div class="reset-badge">{f"resets in {wreset}" if wreset else ""}</div>
+    <div class="proj">{proj_str}</div>
+  </div>
+</div>"""
+
+    stats_sec = f"""<div class="stats">
+  <div class="stat"><div class="val">{burn_str}</div><div class="lbl">Burn rate</div></div>
+  <div class="stat"><div class="val">{budget_str}</div><div class="lbl">Daily budget to stay safe</div></div>
+  <div class="stat"><div class="val">{reset_str}</div><div class="lbl">Days until weekly reset</div></div>
+</div>"""
+
+    sections_html = "\n".join(filter(None, [
+        _sec("tip", tip_sec),
+        _sec("usage", grid_sec),
+        _sec("stats", stats_sec),
+        _sec("suggestion", suggestion_html),
+        _sec("power-user", power_user_html),
+        _sec("extra", extra_html),
+        _sec("per-model", per_model_html),
+        _sec("sessions", session_html),
+        _sec("weekly-chart", chart_html),
+        _sec("day-pattern", pattern_html),
+        _sec("timing", timing_html),
+        _sec("conv-insights", conv_insights_html),
+        _sec("conversations", conversations_html),
+        _sec("model-guide", _model_guide_html(usage, stats)),
+    ]))
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -1364,68 +1599,55 @@ def generate_dashboard(usage, stats, conversations=None):
   .conv-table tr:hover td{{background:rgba(217,119,87,0.05)}}
   .conv-table a{{color:var(--accent);text-decoration:none}}
   .conv-table a:hover{{text-decoration:underline}}
+  .dashboard-header{{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:4px}}
+  .customize-btn{{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+    padding:6px 14px;font-size:.8rem;cursor:pointer;color:var(--muted);transition:all .15s}}
+  .customize-btn:hover{{border-color:var(--accent);color:var(--accent)}}
+  .section-header{{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}}
+  .section-header h2{{margin-bottom:0}}
+  .chart-btns{{display:flex;gap:4px}}
+  .chart-btns button{{background:var(--surface);border:1px solid var(--border);border-radius:6px;
+    padding:3px 10px;font-size:.7rem;cursor:pointer;color:var(--muted);transition:all .15s}}
+  .chart-btns button:hover,.chart-btns button.active{{background:var(--accent);color:#fff;border-color:var(--accent)}}
+  .customize-panel{{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+    padding:16px;margin-bottom:16px}}
+  .customize-panel.hidden{{display:none}}
+  .customize-panel h3{{font-size:.85rem;font-weight:600;margin-bottom:4px}}
+  .customize-list{{list-style:none;padding:0;margin:0}}
+  .customize-list li{{display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:6px;
+    cursor:grab;border:1px solid transparent;font-size:.85rem;transition:background .15s}}
+  .customize-list li:hover{{background:rgba(217,119,87,0.05)}}
+  .customize-list li.dragging{{opacity:0.4;border:1px dashed var(--accent)}}
+  .customize-list .grip{{color:var(--muted);font-size:.7rem;cursor:grab;user-select:none}}
 </style>
 </head>
 <body>
-<h1>
-  <svg width="20" height="20" viewBox="0 0 100 100" fill="none">
-    <circle cx="50" cy="50" r="48" fill="#D97757"/>
-    <text x="50" y="67" text-anchor="middle" font-size="52" fill="white" font-family="-apple-system">◈</text>
-  </svg>
-  ClaudeWatch
-</h1>
-<p class="sub">Updated {now_str}</p>
-
-<div class="tip">{tip}</div>
-
-<div class="grid">
-  <div class="card">
-    <h2>Session Usage (5h)</h2>
-    <div class="big">{spct:.0f}%</div>
-    <div class="bar-wrap"><div class="bar" style="width:{min(spct,100):.1f}%;background:#D97757"></div></div>
-    <div class="bar-labels"><span>used</span><span>100%</span></div>
-    <div class="reset-badge">{f"resets in {sreset}" if sreset else ""}</div>
+<div class="dashboard-header">
+  <div>
+    <h1>
+      <svg width="20" height="20" viewBox="0 0 100 100" fill="none">
+        <circle cx="50" cy="50" r="48" fill="#D97757"/>
+        <text x="50" y="67" text-anchor="middle" font-size="52" fill="white" font-family="-apple-system">◈</text>
+      </svg>
+      ClaudeWatch
+    </h1>
+    <p class="sub">Updated {now_str}</p>
   </div>
-  <div class="card">
-    <h2>Weekly Usage (7d)</h2>
-    <div class="big" style="color:{w_color}">{wpct:.0f}%</div>
-    <div class="bar-wrap"><div class="bar" style="width:{min(wpct,100):.1f}%;background:{w_color}"></div></div>
-    <div class="bar-labels"><span>used</span><span>100%</span></div>
-    <div class="reset-badge">{f"resets in {wreset}" if wreset else ""}</div>
-    <div class="proj">{proj_str}</div>
-  </div>
+  <button class="customize-btn" onclick="toggleCustomize()">Customize</button>
 </div>
 
-<div class="stats">
-  <div class="stat">
-    <div class="val">{burn_str}</div>
-    <div class="lbl">Burn rate</div>
-  </div>
-  <div class="stat">
-    <div class="val">{budget_str}</div>
-    <div class="lbl">Daily budget to stay safe</div>
-  </div>
-  <div class="stat">
-    <div class="val">{reset_str}</div>
-    <div class="lbl">Days until weekly reset</div>
-  </div>
-</div>
+<div id="customize-panel" class="customize-panel hidden"></div>
 
-{suggestion_html}
-{power_user_html}
-{extra_html}
-{per_model_html}
-{session_html}
-{chart_html}
-{pattern_html}
-{timing_html}
-{conv_insights_html}
-{conversations_html}
-{_model_guide_html(usage, stats)}
+<div id="dashboard-sections">
+{sections_html}
+</div>
 
 <div class="footer">ClaudeWatch · data from Claude desktop app · <a href="{CLAUDE_USAGE_URL}" style="color:var(--accent)">open claude.ai</a></div>
-</body>
-</html>"""
+<script>{weekly_data_js}{dow_data_js}</script>
+"""
+
+    html += _DASHBOARD_CUSTOMIZE_JS
+    html += "\n</body>\n</html>"
 
     DASH_PATH.write_text(html, encoding="utf-8")
     return str(DASH_PATH)

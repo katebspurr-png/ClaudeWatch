@@ -1910,37 +1910,73 @@ class ClaudeMonitorApp(rumps.App):
             enriched = {}  # uuid -> actual_model
             detail_errors = []
 
-            for conv in conversations:
+            # Only fetch detail for first conversation to diagnose, then apply to all
+            first_uuid = conversations[0].get("uuid")
+            if first_uuid:
+                try:
+                    detail_session = _make_session(cookies)
+                    detail_resp = detail_session.get(
+                        f"https://claude.ai/api/organizations/{org_id}/chat_conversations/{first_uuid}?tree=True&rendering_mode=messages",
+                        timeout=15,
+                    )
+                    debug_info["detail_status"] = detail_resp.status_code
+                    if detail_resp.status_code == 200:
+                        detail = _decode_response(detail_resp)
+                        debug_info["detail_keys"] = list(detail.keys())
+                        debug_info["detail_model"] = detail.get("model")
+                        debug_info["detail_model_override"] = detail.get("model_override")
+                        debug_info["detail_settings_model"] = (detail.get("settings") or {}).get("model")
+                        debug_info["detail_active_model"] = detail.get("active_model")
+
+                        msgs = detail.get("chat_messages") or []
+                        debug_info["num_messages"] = len(msgs)
+
+                        # Log info about last assistant message
+                        for msg in reversed(msgs):
+                            if msg.get("sender") == "assistant":
+                                debug_info["last_asst_keys"] = list(msg.keys())
+                                debug_info["last_asst_model"] = msg.get("model")
+                                debug_info["last_asst_model_slug"] = msg.get("model_slug")
+                                # Check content for model info
+                                content = msg.get("content")
+                                if isinstance(content, list) and content:
+                                    debug_info["last_asst_content_0_keys"] = list(content[0].keys()) if isinstance(content[0], dict) else type(content[0]).__name__
+                                break
+
+                        model = self._extract_actual_model(detail)
+                        if model:
+                            enriched[first_uuid] = model
+                            debug_info["extracted_model"] = model
+                        else:
+                            debug_info["extracted_model"] = "(empty)"
+                    else:
+                        debug_info["detail_body_preview"] = detail_resp.text[:500]
+                except Exception as e:
+                    debug_info["detail_error"] = str(e)
+
+            # For remaining conversations, fetch details sequentially
+            for conv in conversations[1:]:
                 uuid = conv.get("uuid")
                 if not uuid:
                     continue
                 try:
                     detail_session = _make_session(cookies)
                     detail_resp = detail_session.get(
-                        f"https://claude.ai/api/organizations/{org_id}/chat_conversations/{uuid}",
-                        timeout=10,
+                        f"https://claude.ai/api/organizations/{org_id}/chat_conversations/{uuid}?tree=True&rendering_mode=messages",
+                        timeout=15,
                     )
                     if detail_resp.status_code == 200:
                         detail = _decode_response(detail_resp)
                         model = self._extract_actual_model(detail)
                         if model:
                             enriched[uuid] = model
-                    else:
-                        detail_errors.append({
-                            "uuid": uuid[:8],
-                            "status": detail_resp.status_code,
-                            "body": detail_resp.text[:200],
-                        })
                 except Exception as e:
-                    detail_errors.append({
-                        "uuid": uuid[:8],
-                        "error": str(e),
-                    })
+                    detail_errors.append({"uuid": uuid[:8], "error": str(e)})
 
             debug_info["enriched_count"] = len(enriched)
-            debug_info["enriched_models"] = enriched
+            debug_info["enriched_models"] = {k[:8]: v for k, v in enriched.items()}
             if detail_errors:
-                debug_info["detail_errors"] = detail_errors[:5]  # Keep first 5
+                debug_info["detail_errors"] = detail_errors[:5]
 
             # Set _actual_model on each conversation object
             for conv in conversations:

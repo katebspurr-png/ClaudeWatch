@@ -1839,10 +1839,41 @@ class ClaudeMonitorApp(rumps.App):
     def _start_timer(self):
         self._restart_timer()
 
+    @staticmethod
+    def _extract_actual_model(detail):
+        """Extract the actual model used from a conversation detail response.
+
+        Checks the last assistant message for a model field, then falls back
+        to conversation-level fields like model_override or settings.model.
+        """
+        # Check last assistant message first (most accurate)
+        msgs = detail.get("chat_messages") or []
+        for msg in reversed(msgs):
+            if msg.get("sender") == "assistant":
+                m = msg.get("model")
+                if m:
+                    return m
+                break
+
+        # Conversation-level overrides
+        m = detail.get("model_override")
+        if m:
+            return m
+        settings = detail.get("settings") or {}
+        m = settings.get("model") or settings.get("preview_model")
+        if m:
+            return m
+        m = detail.get("active_model")
+        if m:
+            return m
+        return ""
+
     def _fetch_conversations_data(self):
         """Fetch conversation list from Claude API, enriched with actual model used."""
         import json as _json
         import traceback as _tb
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         debug_log = CONFIG_DIR / "model_debug.json"
         debug_info = {"stage": "init"}
 
@@ -1860,53 +1891,54 @@ class ClaudeMonitorApp(rumps.App):
             debug_info["stage"] = "list_fetched"
             debug_info["num_conversations"] = len(conversations) if conversations else 0
 
-            if conversations:
-                # Dump all keys from the first conversation in the list
-                first = conversations[0]
-                debug_info["list_keys"] = list(first.keys())
-                debug_info["list_model"] = first.get("model")
-                debug_info["list_model_override"] = first.get("model_override")
-                debug_info["list_settings"] = first.get("settings")
-                debug_info["list_active_model"] = first.get("active_model")
-                debug_info["list_name"] = first.get("name")
+            if not conversations:
+                debug_info["stage"] = "done_empty"
+                return conversations
 
-                # Try fetching detail for the first conversation only
-                uuid = first.get("uuid")
-                if uuid:
-                    debug_info["stage"] = "fetching_detail"
+            # Log debug info from the list-level response
+            first = conversations[0]
+            debug_info["list_keys"] = list(first.keys())
+            debug_info["list_model"] = first.get("model")
+            debug_info["list_model_override"] = first.get("model_override")
+            debug_info["list_settings"] = first.get("settings")
+            debug_info["list_active_model"] = first.get("active_model")
+
+            # Fetch detail for each conversation to get the actual model used.
+            # Use a thread pool to parallelize the requests.
+            debug_info["stage"] = "fetching_details"
+            enriched = {}  # uuid -> actual_model
+
+            def _fetch_detail(conv):
+                uuid = conv.get("uuid")
+                if not uuid:
+                    return uuid, ""
+                try:
                     detail_resp = session.get(
                         f"https://claude.ai/api/organizations/{org_id}/chat_conversations/{uuid}?tree=True&rendering_mode=messages",
                         timeout=10,
                     )
-                    debug_info["detail_status"] = detail_resp.status_code
                     if detail_resp.status_code == 200:
                         detail = _decode_response(detail_resp)
-                        debug_info["detail_keys"] = list(detail.keys())
-                        debug_info["detail_model"] = detail.get("model")
-                        debug_info["detail_model_override"] = detail.get("model_override")
-                        debug_info["detail_settings"] = detail.get("settings")
-                        debug_info["detail_active_model"] = detail.get("active_model")
+                        return uuid, self._extract_actual_model(detail)
+                except Exception:
+                    pass
+                return uuid, ""
 
-                        msgs = detail.get("chat_messages") or []
-                        debug_info["num_messages"] = len(msgs)
+            with ThreadPoolExecutor(max_workers=5) as pool:
+                futures = {pool.submit(_fetch_detail, c): c for c in conversations}
+                for fut in as_completed(futures):
+                    uuid, model = fut.result()
+                    if uuid and model:
+                        enriched[uuid] = model
 
-                        # Find last assistant message
-                        for msg in reversed(msgs):
-                            if msg.get("sender") == "assistant":
-                                debug_info["last_asst_keys"] = list(msg.keys())
-                                debug_info["last_asst_model"] = msg.get("model")
-                                # Also check for model in nested content
-                                debug_info["last_asst_content_type"] = type(msg.get("content")).__name__
-                                break
+            debug_info["enriched_count"] = len(enriched)
+            debug_info["enriched_models"] = enriched
 
-                        # Also check first assistant message
-                        for msg in msgs:
-                            if msg.get("sender") == "assistant":
-                                debug_info["first_asst_keys"] = list(msg.keys())
-                                debug_info["first_asst_model"] = msg.get("model")
-                                break
-                    else:
-                        debug_info["detail_body_preview"] = detail_resp.text[:500]
+            # Set _actual_model on each conversation object
+            for conv in conversations:
+                uuid = conv.get("uuid", "")
+                if uuid in enriched:
+                    conv["_actual_model"] = enriched[uuid]
 
             debug_info["stage"] = "done"
             return conversations

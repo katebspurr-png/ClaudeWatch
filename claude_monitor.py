@@ -1854,7 +1854,11 @@ class ClaudeMonitorApp(rumps.App):
         # Enrich recent conversations with the actual model from their last message.
         # The list endpoint often returns the org/project default model, not the one
         # the user selected. We fetch detail for the 10 most recent to get accuracy.
-        for conv in (conversations or [])[:10]:
+        import json as _json
+        debug_log = CONFIG_DIR / "model_debug.json"
+        debug_info = {"list_keys_sample": list((conversations[0] if conversations else {}).keys())}
+
+        for i, conv in enumerate((conversations or [])[:10]):
             uuid = conv.get("uuid")
             if not uuid:
                 continue
@@ -1865,6 +1869,31 @@ class ClaudeMonitorApp(rumps.App):
                 )
                 if detail_resp.status_code == 200:
                     detail = _decode_response(detail_resp)
+                    # Debug: save first conversation's structure
+                    if i == 0:
+                        debug_info["detail_keys"] = list(detail.keys())
+                        msgs = detail.get("chat_messages") or []
+                        debug_info["num_messages"] = len(msgs)
+                        if msgs:
+                            last_asst = None
+                            for m in reversed(msgs):
+                                if m.get("sender") == "assistant":
+                                    last_asst = m
+                                    break
+                            if last_asst:
+                                debug_info["last_assistant_keys"] = list(last_asst.keys())
+                                debug_info["last_assistant_model"] = last_asst.get("model")
+                                debug_info["last_assistant_sender"] = last_asst.get("sender")
+                        # Also dump top-level model fields
+                        debug_info["detail_model"] = detail.get("model")
+                        debug_info["detail_model_override"] = detail.get("model_override")
+                        debug_info["detail_settings"] = detail.get("settings")
+                        debug_info["detail_active_model"] = detail.get("active_model")
+                        # Conv list item fields
+                        debug_info["list_model"] = conv.get("model")
+                        debug_info["list_model_override"] = conv.get("model_override")
+                        debug_info["list_settings"] = conv.get("settings")
+
                     # Look for model in the last assistant message
                     msgs = detail.get("chat_messages") or []
                     for msg in reversed(msgs):
@@ -1873,8 +1902,14 @@ class ClaudeMonitorApp(rumps.App):
                             if actual_model:
                                 conv["_actual_model"] = actual_model
                             break
-            except Exception:
-                continue  # Don't let enrichment failures break the list
+            except Exception as exc:
+                debug_info[f"error_{i}"] = str(exc)
+                continue
+
+        try:
+            debug_log.write_text(_json.dumps(debug_info, indent=2, default=str))
+        except Exception:
+            pass
 
         return conversations
 

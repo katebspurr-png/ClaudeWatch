@@ -1904,35 +1904,43 @@ class ClaudeMonitorApp(rumps.App):
             debug_info["list_active_model"] = first.get("active_model")
 
             # Fetch detail for each conversation to get the actual model used.
-            # Use a thread pool to parallelize the requests.
+            # Use sequential requests with a fresh session per batch to avoid
+            # thread-safety issues and rate limiting.
             debug_info["stage"] = "fetching_details"
             enriched = {}  # uuid -> actual_model
+            detail_errors = []
 
-            def _fetch_detail(conv):
+            for conv in conversations:
                 uuid = conv.get("uuid")
                 if not uuid:
-                    return uuid, ""
+                    continue
                 try:
-                    detail_resp = session.get(
-                        f"https://claude.ai/api/organizations/{org_id}/chat_conversations/{uuid}?tree=True&rendering_mode=messages",
+                    detail_session = _make_session(cookies)
+                    detail_resp = detail_session.get(
+                        f"https://claude.ai/api/organizations/{org_id}/chat_conversations/{uuid}",
                         timeout=10,
                     )
                     if detail_resp.status_code == 200:
                         detail = _decode_response(detail_resp)
-                        return uuid, self._extract_actual_model(detail)
-                except Exception:
-                    pass
-                return uuid, ""
-
-            with ThreadPoolExecutor(max_workers=5) as pool:
-                futures = {pool.submit(_fetch_detail, c): c for c in conversations}
-                for fut in as_completed(futures):
-                    uuid, model = fut.result()
-                    if uuid and model:
-                        enriched[uuid] = model
+                        model = self._extract_actual_model(detail)
+                        if model:
+                            enriched[uuid] = model
+                    else:
+                        detail_errors.append({
+                            "uuid": uuid[:8],
+                            "status": detail_resp.status_code,
+                            "body": detail_resp.text[:200],
+                        })
+                except Exception as e:
+                    detail_errors.append({
+                        "uuid": uuid[:8],
+                        "error": str(e),
+                    })
 
             debug_info["enriched_count"] = len(enriched)
             debug_info["enriched_models"] = enriched
+            if detail_errors:
+                debug_info["detail_errors"] = detail_errors[:5]  # Keep first 5
 
             # Set _actual_model on each conversation object
             for conv in conversations:

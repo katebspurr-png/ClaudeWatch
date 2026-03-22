@@ -22,6 +22,12 @@ try:
 except ImportError:
     DEPS_OK = False
 
+try:
+    import zstandard
+    ZSTD_OK = True
+except ImportError:
+    ZSTD_OK = False
+
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 CONFIG_DIR  = Path.home() / ".claude_monitor"
@@ -50,12 +56,47 @@ EXTRA_THRESHOLDS   = [80, 95]   # % extra credits to notify at
 REFRESH_OPTIONS = [1, 5, 15, 30]  # minutes
 
 MODEL_DISPLAY = {
-    "claude-sonnet-4-6": "Sonnet 4.6",
-    "claude-opus-4-6":   "Opus 4.6",
-    "claude-haiku-4-5":  "Haiku 4.5",
-    "claude-sonnet-4-5": "Sonnet 4.5",
-    "claude-opus-4-5":   "Opus 4.5",
+    "claude-sonnet-4-6":          "Sonnet 4.6",
+    "claude-opus-4-6":            "Opus 4.6",
+    "claude-haiku-4-5":           "Haiku 4.5",
+    "claude-sonnet-4-5":          "Sonnet 4.5",
+    "claude-opus-4-5":            "Opus 4.5",
+    # Versioned IDs sometimes returned by message-level API
+    "claude-sonnet-4-6-20250514": "Sonnet 4.6",
+    "claude-opus-4-6-20250514":   "Opus 4.6",
+    "claude-haiku-4-5-20251001":  "Haiku 4.5",
+    "claude-sonnet-4-5-20241022": "Sonnet 4.5",
+    "claude-opus-4-5-20250115":   "Opus 4.5",
+    # Older model IDs
+    "claude-3-5-sonnet-20241022": "Sonnet 3.5",
+    "claude-3-5-haiku-20241022":  "Haiku 3.5",
+    "claude-3-opus-20240229":     "Opus 3",
 }
+
+
+def _get_conversation_model(conv):
+    """
+    Extract the most accurate model from a conversation object.
+    The API 'model' field is often the org/project default, not what was
+    actually used. Check several fields in priority order.
+    """
+    # 1. Enriched actual model from last assistant message (set by _fetch_conversations_data)
+    model_id = conv.get("_actual_model") or ""
+    # 2. model_override — set when user explicitly picks a different model
+    if not model_id:
+        model_id = conv.get("model_override") or ""
+    # 3. settings.model or settings.preview_model
+    if not model_id:
+        settings = conv.get("settings") or {}
+        model_id = settings.get("model") or settings.get("preview_model") or ""
+    # 4. active_model — some API versions include this
+    if not model_id:
+        model_id = conv.get("active_model") or ""
+    # 5. Fall back to conversation-level default
+    if not model_id:
+        model_id = conv.get("model") or ""
+
+    return model_id, MODEL_DISPLAY.get(model_id, model_id.split("-")[-1].title() if model_id else "—")
 
 
 # ─── Cookie decryption ───────────────────────────────────────────────────────
@@ -101,7 +142,11 @@ def get_claude_cookies():
 def _decode_response(resp):
     """Decode API response, handling zstd compression."""
     if resp.headers.get("Content-Encoding") == "zstd":
-        import zstandard
+        if not ZSTD_OK:
+            raise RuntimeError(
+                "Server sent zstd response but zstandard is not installed. "
+                "Run: pip install zstandard"
+            )
         dctx = zstandard.ZstdDecompressor()
         return json.loads(dctx.decompress(resp.content))
     return resp.json()
@@ -117,6 +162,7 @@ def _make_session(cookies):
                       "AppleWebKit/537.36 (KHTML, like Gecko) "
                       "Chrome/131.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
+        "Accept-Encoding": "gzip, deflate" if not ZSTD_OK else "gzip, deflate, zstd",
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": "https://claude.ai/",
         "Origin": "https://claude.ai",
@@ -492,6 +538,192 @@ def _per_model_html(usage):
     </div>"""
 
 
+# ─── Power-user analytics ────────────────────────────────────────────────────
+
+def calc_velocity(rows, window_minutes=30):
+    """
+    Calculate burn velocity over the last `window_minutes`.
+    Returns dict with session and weekly velocity (% per hour),
+    delta since last reading, and raw deltas.
+    """
+    if len(rows) < 2:
+        return None
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(minutes=window_minutes)
+
+    # Find readings within the window
+    window_rows = []
+    for ts, s_pct, w_pct, *_ in rows:
+        try:
+            dt = datetime.fromisoformat(ts)
+        except Exception:
+            continue
+        if dt >= cutoff:
+            window_rows.append((dt, s_pct, w_pct))
+
+    # Delta since last refresh (last two readings regardless of window)
+    last_ts, last_s, last_w, *_ = rows[-1]
+    prev_ts, prev_s, prev_w, *_ = rows[-2]
+    session_delta = last_s - prev_s
+    weekly_delta = last_w - prev_w
+
+    if len(window_rows) >= 2:
+        first_dt, first_s, first_w = window_rows[0]
+        last_dt, last_s_w, last_w_w = window_rows[-1]
+        hours = max((last_dt - first_dt).total_seconds() / 3600, 0.001)
+        session_velocity = (last_s_w - first_s) / hours  # % per hour
+        weekly_velocity = (last_w_w - first_w) / hours
+    else:
+        session_velocity = 0
+        weekly_velocity = 0
+
+    return {
+        "session_velocity": session_velocity,  # % per hour
+        "weekly_velocity": weekly_velocity,
+        "session_delta": session_delta,        # change since last refresh
+        "weekly_delta": weekly_delta,
+        "window_minutes": window_minutes,
+    }
+
+
+def calc_runway(usage, velocity):
+    """
+    Estimate time until session/weekly limits at current pace.
+    Returns dict with runway estimates in minutes, or None if not burning.
+    """
+    result = {}
+
+    spct = usage["session_pct"]
+    wpct = usage["weekly_pct"]
+
+    # Session runway
+    s_vel = velocity["session_velocity"] if velocity else 0
+    if s_vel > 0.1:  # meaningful burn rate (>0.1%/hr)
+        remaining = 100 - spct
+        hours_left = remaining / s_vel
+        result["session_runway_min"] = hours_left * 60
+    else:
+        result["session_runway_min"] = None
+
+    # Weekly runway
+    w_vel = velocity["weekly_velocity"] if velocity else 0
+    if w_vel > 0.1:
+        remaining = 100 - wpct
+        hours_left = remaining / w_vel
+        result["weekly_runway_min"] = hours_left * 60
+    else:
+        result["weekly_runway_min"] = None
+
+    return result
+
+
+def estimate_messages_remaining(usage, rows):
+    """
+    Estimate how many messages remain based on average % cost per interaction.
+    Looks at positive session_pct deltas (each one ~ a message or burst).
+    Returns dict with estimates per model, or None if not enough data.
+    """
+    if len(rows) < 5:
+        return None
+
+    # Collect positive session deltas (each represents usage from a message/burst)
+    deltas = []
+    prev_s = None
+    prev_reset = None
+    for ts, s_pct, w_pct, reset_at, *_ in rows:
+        if prev_s is not None:
+            # Skip if session reset happened (reset_at changed)
+            if reset_at != prev_reset and s_pct < prev_s:
+                prev_s = s_pct
+                prev_reset = reset_at
+                continue
+            inc = s_pct - prev_s
+            if 0.1 < inc < 30:  # plausible single interaction (0.1% to 30%)
+                deltas.append(inc)
+        prev_s = s_pct
+        prev_reset = reset_at
+
+    if len(deltas) < 3:
+        return None
+
+    avg_cost = sum(deltas) / len(deltas)
+    median_cost = sorted(deltas)[len(deltas) // 2]
+
+    session_remaining = max(100 - usage["session_pct"], 0)
+    weekly_remaining = max(100 - usage["weekly_pct"], 0)
+
+    # Use median for more robust estimate (outliers from big prompts)
+    cost = median_cost if median_cost > 0 else avg_cost
+    if cost <= 0:
+        return None
+
+    return {
+        "avg_cost_per_msg": avg_cost,
+        "median_cost_per_msg": median_cost,
+        "session_msgs_left": int(session_remaining / cost),
+        "weekly_msgs_left": int(weekly_remaining / cost),
+        "sample_size": len(deltas),
+    }
+
+
+def smart_suggestion(usage, stats, velocity):
+    """
+    Generate a single actionable suggestion string for the menu bar.
+    Returns (emoji, text) or None.
+    """
+    spct = usage["session_pct"]
+    wpct = usage["weekly_pct"]
+
+    # Urgent: session almost full
+    if spct >= 85:
+        sr = _fmt_reset(usage.get("session_resets_at", ""))
+        return ("🔴", f"Session nearly full — resets in {sr}" if sr else "Session nearly full — pause and wait for reset")
+
+    # Burning fast right now
+    if velocity and velocity["session_velocity"] > 20:
+        return ("🔥", f"Burning {velocity['session_velocity']:.0f}%/hr — switch to Haiku for lighter tasks")
+
+    # Weekly getting high, suggest conservation
+    if wpct >= 70:
+        if stats and stats["days_until_reset"] > 2:
+            return ("⚠️", f"Weekly at {wpct:.0f}% with {stats['days_until_reset']:.0f}d left — use Haiku where possible")
+        elif stats:
+            return ("⚠️", f"Weekly at {wpct:.0f}% — resets in {stats['days_until_reset']:.1f}d, conserve Opus")
+
+    # Will hit limit before reset
+    if stats and stats.get("hits_limit"):
+        return ("⚠️", "On track to hit weekly limit — switch to Haiku for routine tasks")
+
+    # Session heating up
+    if spct >= 60:
+        return ("🟡", f"Session at {spct:.0f}% — consider batching questions or switching to Haiku")
+
+    # Everything's fine, encourage Opus if lots of headroom
+    if wpct < 20 and spct < 30:
+        return ("🟢", "Plenty of headroom — good time for Opus on complex tasks")
+
+    if wpct < 40:
+        return ("🟢", "Usage healthy — Sonnet for most tasks, Opus when needed")
+
+    return None
+
+
+def _fmt_runway(minutes):
+    """Format runway minutes into readable string."""
+    if minutes is None:
+        return None
+    if minutes < 1:
+        return "<1 min"
+    if minutes < 60:
+        return f"{minutes:.0f} min"
+    hours = minutes / 60
+    if hours < 24:
+        return f"{hours:.1f}h"
+    days = hours / 24
+    return f"{days:.1f}d"
+
+
 def load_session_history():
     """Return recent session data points with reset boundaries from DB."""
     conn = sqlite3.connect(str(DB_PATH))
@@ -585,10 +817,9 @@ def _conversations_dashboard_html(conversations):
     for c in conversations[:10]:
         name = c.get("name") or "Untitled"
         if len(name) > 60:
-            name = name[:57] + "…"
+            name = name[:57] + "..."
         uuid = c.get("uuid", "")
-        model_id = c.get("model") or ""
-        model = MODEL_DISPLAY.get(model_id, model_id.split("-")[-1].title() if model_id else "—")
+        _, model = _get_conversation_model(c)
         project = (c.get("project") or {}).get("name") or "—"
         updated = _relative_time(c.get("updated_at", ""))
         link = f"https://claude.ai/chat/{uuid}" if uuid else "#"
@@ -611,6 +842,283 @@ def _conversations_dashboard_html(conversations):
 
 
 # ─── Dashboard HTML ──────────────────────────────────────────────────────────
+
+# Rough cost weights per model (relative to Sonnet = 1.0)
+MODEL_COST_WEIGHT = {
+    "claude-sonnet-4-6": 1.0,
+    "claude-sonnet-4-5": 1.0,
+    "claude-haiku-4-5":  0.15,
+    "claude-opus-4-6":   5.0,
+    "claude-opus-4-5":   5.0,
+}
+
+
+def _conversation_insights_html(conversations):
+    """Rank conversations by estimated cost and show insights."""
+    if not conversations or len(conversations) < 2:
+        return ""
+
+    # Estimate relative cost from model and recency (more recent = more active = higher cost)
+    ranked = []
+    now = datetime.now(timezone.utc)
+    for c in conversations[:20]:
+        model_id, model_label = _get_conversation_model(c)
+        weight = MODEL_COST_WEIGHT.get(model_id, 1.0)
+        name = c.get("name") or "Untitled"
+        uuid = c.get("uuid", "")
+        updated = c.get("updated_at", "")
+
+        # Estimate "size" from created_at vs updated_at span
+        created = c.get("created_at", updated)
+        try:
+            created_dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            updated_dt = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+            duration_hrs = max((updated_dt - created_dt).total_seconds() / 3600, 0.1)
+        except Exception:
+            duration_hrs = 1.0
+
+        # Longer conversations on heavier models = more expensive
+        # This is a rough heuristic but directionally useful
+        estimated_cost = weight * min(duration_hrs, 24)  # cap at 24h
+
+        if len(name) > 45:
+            name = name[:42] + "..."
+
+        ranked.append({
+            "name": name,
+            "uuid": uuid,
+            "model": model_label,
+            "weight": weight,
+            "duration_hrs": duration_hrs,
+            "cost": estimated_cost,
+        })
+
+    ranked.sort(key=lambda x: x["cost"], reverse=True)
+    max_cost = ranked[0]["cost"] if ranked else 1
+
+    rows = ""
+    for i, c in enumerate(ranked[:8]):
+        bar_width = c["cost"] / max_cost * 100
+        bar_color = "#ef4444" if c["weight"] >= 5 else "#f59e0b" if c["weight"] >= 1 else "#22c55e"
+        link = f"https://claude.ai/chat/{c['uuid']}" if c["uuid"] else "#"
+        label = "Heavy" if c["weight"] >= 5 else "Medium" if c["weight"] >= 1 else "Light"
+        rows += f"""
+        <div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border)">
+          <span style="font-size:.75rem;color:var(--muted);width:16px;text-align:right">{i+1}</span>
+          <div style="flex:1;min-width:0">
+            <a href="{link}" target="_blank" style="color:var(--accent);text-decoration:none;font-size:.85rem;
+               white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block">{c['name']}</a>
+            <div style="font-size:.7rem;color:var(--muted)">{c['model']} · {c['duration_hrs']:.1f}h · {label}</div>
+          </div>
+          <div style="width:80px;background:var(--border);border-radius:4px;height:6px;flex-shrink:0">
+            <div style="width:{bar_width:.0f}%;background:{bar_color};border-radius:4px;height:100%"></div>
+          </div>
+        </div>"""
+
+    # Model mix breakdown
+    model_counts = {}
+    for c in conversations[:20]:
+        _, m = _get_conversation_model(c)
+        model_counts[m] = model_counts.get(m, 0) + 1
+    total = sum(model_counts.values())
+    mix_parts = " · ".join(f"{m}: {n}" for m, n in sorted(model_counts.items(), key=lambda x: -x[1]))
+
+    return f"""
+    <div class="card">
+      <h2>Conversation Cost Ranking (Estimated)</h2>
+      <p style="font-size:.75rem;color:var(--muted);margin-bottom:10px">
+        Ranked by model weight x duration. Longer Opus conversations cost more.
+      </p>
+      {rows}
+      <div style="font-size:.75rem;color:var(--muted);margin-top:12px;padding-top:8px;border-top:1px solid var(--border)">
+        Model mix (last {total}): {mix_parts}
+      </div>
+    </div>"""
+
+
+def _optimal_timing_html(stats):
+    """Show optimal timing insights based on day-of-week and burn patterns."""
+    if not stats:
+        return ""
+    patterns = stats.get("day_patterns")
+    if not patterns or len(patterns) < 5:
+        return ""
+
+    today = datetime.now().weekday()
+    sorted_days = sorted(patterns.items(), key=lambda x: x[1])
+    lightest_dow, lightest_val = sorted_days[0]
+    heaviest_dow, heaviest_val = sorted_days[-1]
+
+    overall_avg = sum(patterns.values()) / len(patterns)
+
+    # Build heatmap-style row
+    cells = ""
+    for dow in range(7):
+        val = patterns.get(dow, 0)
+        if val > overall_avg * 1.4:
+            bg = "rgba(239,68,68,0.2)"
+            border = "#ef4444"
+        elif val > overall_avg * 0.8:
+            bg = "rgba(245,158,11,0.15)"
+            border = "#f59e0b"
+        else:
+            bg = "rgba(34,197,94,0.15)"
+            border = "#22c55e"
+        is_today = "2px solid var(--accent)" if dow == today else f"1px solid {border}"
+        today_label = "<div style='font-size:.55rem;color:var(--accent)'>TODAY</div>" if dow == today else ""
+        cells += f"""
+        <div style="flex:1;text-align:center;padding:8px 4px;background:{bg};border:{is_today};border-radius:6px">
+          <div style="font-size:.7rem;color:var(--muted)">{DOW_SHORT[dow]}</div>
+          <div style="font-size:1rem;font-weight:700">{val:.1f}%</div>
+          {today_label}
+        </div>"""
+
+    # Actionable insight
+    days_to_lightest = (lightest_dow - today) % 7
+    days_to_heaviest = (heaviest_dow - today) % 7
+
+    insights = []
+    if days_to_lightest == 0:
+        insights.append("Today is typically your lightest day — great time for complex Opus work.")
+    elif days_to_lightest <= 2:
+        insights.append(f"{DOW_NAMES[lightest_dow]} is your lightest day — save Opus-heavy work for then.")
+
+    if days_to_heaviest == 0:
+        insights.append("Today is typically your heaviest day — consider front-loading important work early.")
+    elif days_to_heaviest == 1:
+        insights.append(f"Tomorrow ({DOW_NAMES[heaviest_dow]}) is typically heavy — plan accordingly.")
+
+    # Budget recommendation based on today's pattern
+    today_expected = patterns.get(today, overall_avg)
+    burn_rate = stats.get("burn_per_day", 0)
+    budget = stats.get("daily_budget", 0)
+    if today_expected > overall_avg * 1.3 and budget > 0:
+        insights.append(f"Today's typical burn ({today_expected:.1f}%) exceeds your avg ({overall_avg:.1f}%). Budget: {budget:.1f}%/day to stay safe.")
+
+    insights_html = "".join(f"<li style='margin-bottom:4px'>{i}</li>" for i in insights) if insights else "<li>Your usage is evenly distributed — no strong patterns yet.</li>"
+
+    return f"""
+    <div class="card">
+      <h2>Optimal Timing</h2>
+      <p style="font-size:.75rem;color:var(--muted);margin-bottom:10px">
+        Average daily burn rate by day of week. Plan heavy work on green days.
+      </p>
+      <div style="display:flex;gap:4px;margin-bottom:14px">
+        {cells}
+      </div>
+      <ul style="font-size:.85rem;padding-left:18px;line-height:1.7;color:var(--text)">
+        {insights_html}
+      </ul>
+    </div>"""
+
+
+def _power_user_dashboard_html(usage, stats, velocity, runway, msg_est):
+    """Render the power-user analytics section of the dashboard."""
+    sections = []
+
+    # Live Pace card
+    if velocity and velocity["session_velocity"] > 0.1:
+        s_vel = velocity["session_velocity"]
+        w_vel = velocity["weekly_velocity"]
+        s_delta = velocity["session_delta"]
+        w_delta = velocity["weekly_delta"]
+
+        # Pace indicator
+        if s_vel > 20:
+            pace_icon, pace_label, pace_color = "🔥", "Sprinting", "#ef4444"
+        elif s_vel > 8:
+            pace_icon, pace_label, pace_color = "🟡", "Moderate", "#f59e0b"
+        else:
+            pace_icon, pace_label, pace_color = "🟢", "Cruising", "#22c55e"
+
+        delta_s_str = f"+{s_delta:.1f}%" if s_delta > 0 else f"{s_delta:.1f}%"
+        delta_w_str = f"+{w_delta:.1f}%" if w_delta > 0 else f"{w_delta:.1f}%"
+
+        sections.append(f"""
+        <div class="card">
+          <h2>Live Pace</h2>
+          <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
+            <span style="font-size:2rem">{pace_icon}</span>
+            <div>
+              <div class="big" style="font-size:1.6rem;color:{pace_color}">{pace_label}</div>
+              <div class="label">{s_vel:.1f}%/hr session · {w_vel:.1f}%/hr weekly</div>
+            </div>
+          </div>
+          <div style="display:flex;gap:24px;font-size:.85rem;color:var(--muted)">
+            <span>Session delta: <b style="color:var(--text)">{delta_s_str}</b></span>
+            <span>Weekly delta: <b style="color:var(--text)">{delta_w_str}</b></span>
+          </div>
+        </div>""")
+
+    # Runway card
+    if runway:
+        sr = _fmt_runway(runway.get("session_runway_min"))
+        wr = _fmt_runway(runway.get("weekly_runway_min"))
+        if sr or wr:
+            items = []
+            if sr:
+                sr_min = runway["session_runway_min"]
+                sr_color = "#ef4444" if sr_min < 30 else "#f59e0b" if sr_min < 120 else "#22c55e"
+                items.append(f"""
+                <div style="flex:1;text-align:center;padding:12px;background:var(--bg);border-radius:8px">
+                  <div style="font-size:1.6rem;font-weight:700;color:{sr_color}">~{sr}</div>
+                  <div class="label">until session limit</div>
+                </div>""")
+            if wr:
+                wr_min = runway["weekly_runway_min"]
+                wr_color = "#ef4444" if wr_min < 1440 else "#f59e0b" if wr_min < 4320 else "#22c55e"
+                items.append(f"""
+                <div style="flex:1;text-align:center;padding:12px;background:var(--bg);border-radius:8px">
+                  <div style="font-size:1.6rem;font-weight:700;color:{wr_color}">~{wr}</div>
+                  <div class="label">until weekly limit</div>
+                </div>""")
+            sections.append(f"""
+            <div class="card">
+              <h2>Runway — At Current Pace</h2>
+              <div style="display:flex;gap:12px">{"".join(items)}</div>
+              <p style="font-size:.75rem;color:var(--muted);margin-top:10px">Based on your burn rate over the last 30 minutes</p>
+            </div>""")
+
+    # Messages remaining card
+    if msg_est:
+        s_msgs = msg_est["session_msgs_left"]
+        w_msgs = msg_est["weekly_msgs_left"]
+        samples = msg_est["sample_size"]
+        avg_cost = msg_est["avg_cost_per_msg"]
+
+        s_color = "#ef4444" if s_msgs < 5 else "#f59e0b" if s_msgs < 15 else "#22c55e"
+        w_color = "#ef4444" if w_msgs < 10 else "#f59e0b" if w_msgs < 30 else "#22c55e"
+
+        sections.append(f"""
+        <div class="card">
+          <h2>Messages Remaining (Estimate)</h2>
+          <div style="display:flex;gap:12px">
+            <div style="flex:1;text-align:center;padding:12px;background:var(--bg);border-radius:8px">
+              <div style="font-size:2rem;font-weight:700;color:{s_color}">~{s_msgs}</div>
+              <div class="label">this session</div>
+            </div>
+            <div style="flex:1;text-align:center;padding:12px;background:var(--bg);border-radius:8px">
+              <div style="font-size:2rem;font-weight:700;color:{w_color}">~{w_msgs}</div>
+              <div class="label">this week</div>
+            </div>
+          </div>
+          <p style="font-size:.75rem;color:var(--muted);margin-top:10px">
+            Based on {samples} recent interactions (avg {avg_cost:.1f}% per message).
+            Actual count varies by message length and model.
+          </p>
+        </div>""")
+
+    if not sections:
+        return ""
+
+    return f"""
+    <div style="margin-bottom:16px">
+      <h2 style="font-size:.8rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:12px">
+        Live Intelligence
+      </h2>
+      {"".join(sections)}
+    </div>"""
+
 
 def generate_dashboard(usage, stats, conversations=None):
     spct     = usage["session_pct"]
@@ -769,6 +1277,31 @@ def generate_dashboard(usage, stats, conversations=None):
 
     conversations_html = _conversations_dashboard_html(conversations)
 
+    # Power-user analytics
+    history_rows = load_history()
+    velocity = calc_velocity(history_rows)
+    runway = calc_runway(usage, velocity)
+    msg_est = estimate_messages_remaining(usage, history_rows)
+    power_user_html = _power_user_dashboard_html(usage, stats, velocity, runway, msg_est)
+
+    # Smart suggestion banner
+    suggestion = smart_suggestion(usage, stats, velocity)
+    if suggestion:
+        s_emoji, s_text = suggestion
+        suggestion_html = f"""
+        <div style="background:var(--surface);border:1px solid var(--border);border-left:3px solid var(--accent);
+                    border-radius:var(--radius);padding:14px 16px;margin-bottom:16px;font-size:.9rem;
+                    display:flex;align-items:center;gap:10px">
+          <span style="font-size:1.3rem">{s_emoji}</span>
+          <span>{s_text}</span>
+        </div>"""
+    else:
+        suggestion_html = ""
+
+    # Conversation insights and optimal timing
+    conv_insights_html = _conversation_insights_html(conversations)
+    timing_html = _optimal_timing_html(stats)
+
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -875,11 +1408,15 @@ def generate_dashboard(usage, stats, conversations=None):
   </div>
 </div>
 
+{suggestion_html}
+{power_user_html}
 {extra_html}
 {per_model_html}
 {session_html}
 {chart_html}
 {pattern_html}
+{timing_html}
+{conv_insights_html}
 {conversations_html}
 {_model_guide_html(usage, stats)}
 
@@ -957,9 +1494,8 @@ def _build_conversations_html(conversations):
     for c in conversations:
         name = c.get("name", "Untitled") or "Untitled"
         if len(name) > 60:
-            name = name[:57] + "…"
-        model_id = c.get("model", "")
-        model = MODEL_DISPLAY.get(model_id, model_id.replace("claude-", "").title())
+            name = name[:57] + "..."
+        _, model = _get_conversation_model(c)
         project = (c.get("project") or {}).get("name", "—") or "—"
         updated = _relative_time(c.get("updated_at", ""))
         uuid = c.get("uuid", "")
@@ -992,14 +1528,45 @@ a:hover {{ text-decoration: underline; }}
 </table></body></html>"""
 
 
-def _build_title(usage, config):
+SPARKLINE_CHARS = "▁▂▃▄▅▆▇█"
+
+
+def _sparkline(values, width=6):
+    """Build a tiny sparkline string from a list of numeric values."""
+    if not values or len(values) < 2:
+        return ""
+    recent = values[-width:]
+    lo, hi = min(recent), max(recent)
+    spread = hi - lo
+    if spread < 0.5:
+        # Flat line — all same level
+        idx = min(int(lo / 100 * (len(SPARKLINE_CHARS) - 1)), len(SPARKLINE_CHARS) - 1)
+        return SPARKLINE_CHARS[idx] * len(recent)
+    return "".join(
+        SPARKLINE_CHARS[min(int((v - lo) / spread * (len(SPARKLINE_CHARS) - 1)), len(SPARKLINE_CHARS) - 1)]
+        for v in recent
+    )
+
+
+def _build_title(usage, config, velocity=None, recent_session_pcts=None):
     if usage is None:
         return "!"
     parts = []
     if config.get("show_session_pct"):
-        parts.append(f"{usage['session_pct']:.0f}%")
+        s_str = f"{usage['session_pct']:.0f}%"
+        if velocity and abs(velocity["session_delta"]) >= 0.1:
+            d = velocity["session_delta"]
+            s_str += f"+{d:.0f}" if d > 0 else f"{d:.0f}"
+        # Sparkline of recent session readings
+        if recent_session_pcts and len(recent_session_pcts) >= 3:
+            s_str += _sparkline(recent_session_pcts)
+        parts.append(s_str)
     if config.get("show_weekly_pct"):
-        parts.append(f"{usage['weekly_pct']:.0f}%")
+        w_str = f"{usage['weekly_pct']:.0f}%"
+        if velocity and abs(velocity["weekly_delta"]) >= 0.1:
+            d = velocity["weekly_delta"]
+            w_str += f"+{d:.0f}" if d > 0 else f"{d:.0f}"
+        parts.append(w_str)
     title = " | ".join(parts) if parts else "◈"
     if config.get("show_reset_time"):
         reset = _fmt_reset(usage.get("session_resets_at", ""))
@@ -1014,7 +1581,7 @@ def _build_title(usage, config):
     return title
 
 
-def _build_tooltip(usage):
+def _build_tooltip(usage, velocity=None, runway=None, msg_est=None):
     if usage is None:
         return "ClaudeWatch — no data"
     spct = usage.get("session_pct", 0)
@@ -1026,6 +1593,23 @@ def _build_tooltip(usage):
         f"Session (5h):  {spct:.0f}%" + (f"  —  resets in {sr}" if sr else ""),
         f"Weekly  (7d):  {wpct:.0f}%" + (f"  —  resets in {wr}" if wr else ""),
     ]
+    # Velocity
+    if velocity and velocity["session_velocity"] > 0.1:
+        lines.append(f"Pace:  {velocity['session_velocity']:.1f}%/hr session, {velocity['weekly_velocity']:.1f}%/hr weekly")
+    # Runway
+    if runway:
+        parts = []
+        sr_run = _fmt_runway(runway.get("session_runway_min"))
+        wr_run = _fmt_runway(runway.get("weekly_runway_min"))
+        if sr_run:
+            parts.append(f"session limit in ~{sr_run}")
+        if wr_run:
+            parts.append(f"weekly limit in ~{wr_run}")
+        if parts:
+            lines.append("Runway:  " + ", ".join(parts))
+    # Messages remaining
+    if msg_est:
+        lines.append(f"~{msg_est['session_msgs_left']} msgs left in session, ~{msg_est['weekly_msgs_left']} this week")
     # Per-model breakdowns
     for label, info in usage.get("per_model", {}).items():
         pct = info["utilization"]
@@ -1132,10 +1716,16 @@ class ClaudeMonitorApp(rumps.App):
             None,
             rumps.MenuItem("⬤  Session (5h)",   callback=None),
             rumps.MenuItem("   —",               callback=None),
+            rumps.MenuItem("   session_runway",  callback=None),
             rumps.MenuItem("⬤  Weekly (7d)",    callback=None),
             rumps.MenuItem("   —  ",             callback=None),
+            rumps.MenuItem("   weekly_runway",   callback=None),
             rumps.MenuItem("   per_model_line",  callback=None),
             rumps.MenuItem("   extra_credits",   callback=None),
+            None,
+            rumps.MenuItem("   velocity_line",   callback=None),
+            rumps.MenuItem("   msgs_remaining",  callback=None),
+            rumps.MenuItem("   suggestion_line", callback=None),
             None,
             model_guide,
             settings,
@@ -1145,8 +1735,10 @@ class ClaudeMonitorApp(rumps.App):
             rumps.MenuItem("Quit",               callback=self.quit_app),
         ]
 
-        # Hide per-model and extra items initially
-        for key in ("   per_model_line", "   extra_credits"):
+        # Hide dynamic items initially
+        for key in ("   per_model_line", "   extra_credits",
+                    "   session_runway", "   weekly_runway",
+                    "   velocity_line", "   msgs_remaining", "   suggestion_line"):
             self.menu[key].hidden = True
 
         if DEPS_OK:
@@ -1247,17 +1839,119 @@ class ClaudeMonitorApp(rumps.App):
     def _start_timer(self):
         self._restart_timer()
 
+    @staticmethod
+    def _extract_actual_model(detail):
+        """Extract the actual model used from a conversation detail response.
+
+        Checks the last assistant message for a model field, then falls back
+        to conversation-level fields like model_override or settings.model.
+        """
+        # Check last assistant message first (most accurate)
+        msgs = detail.get("chat_messages") or []
+        for msg in reversed(msgs):
+            if msg.get("sender") == "assistant":
+                m = msg.get("model")
+                if m:
+                    return m
+                break
+
+        # Conversation-level overrides
+        m = detail.get("model_override")
+        if m:
+            return m
+        settings = detail.get("settings") or {}
+        m = settings.get("model") or settings.get("preview_model")
+        if m:
+            return m
+        m = detail.get("active_model")
+        if m:
+            return m
+        return ""
+
     def _fetch_conversations_data(self):
-        """Fetch conversation list from Claude API. Returns list or None."""
-        cookies = get_claude_cookies()
-        org_id = cookies.get("lastActiveOrg", "")
-        session = _make_session(cookies)
-        resp = session.get(
-            f"https://claude.ai/api/organizations/{org_id}/chat_conversations?limit=20",
-            timeout=15,
-        )
-        resp.raise_for_status()
-        return _decode_response(resp)
+        """Fetch conversation list from Claude API, enriched with actual model used."""
+        import json as _json
+        import traceback as _tb
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        debug_log = CONFIG_DIR / "model_debug.json"
+        debug_info = {"stage": "init"}
+
+        try:
+            cookies = get_claude_cookies()
+            org_id = cookies.get("lastActiveOrg", "")
+            session = _make_session(cookies)
+            debug_info["stage"] = "fetching_list"
+            resp = session.get(
+                f"https://claude.ai/api/organizations/{org_id}/chat_conversations?limit=20",
+                timeout=15,
+            )
+            resp.raise_for_status()
+            conversations = _decode_response(resp)
+            debug_info["stage"] = "list_fetched"
+            debug_info["num_conversations"] = len(conversations) if conversations else 0
+
+            if not conversations:
+                debug_info["stage"] = "done_empty"
+                return conversations
+
+            # Log debug info from the list-level response
+            first = conversations[0]
+            debug_info["list_keys"] = list(first.keys())
+            debug_info["list_model"] = first.get("model")
+            debug_info["list_model_override"] = first.get("model_override")
+            debug_info["list_settings"] = first.get("settings")
+            debug_info["list_active_model"] = first.get("active_model")
+
+            # Fetch detail for each conversation to get the actual model used.
+            # Use a thread pool to parallelize the requests.
+            debug_info["stage"] = "fetching_details"
+            enriched = {}  # uuid -> actual_model
+
+            def _fetch_detail(conv):
+                uuid = conv.get("uuid")
+                if not uuid:
+                    return uuid, ""
+                try:
+                    detail_resp = session.get(
+                        f"https://claude.ai/api/organizations/{org_id}/chat_conversations/{uuid}?tree=True&rendering_mode=messages",
+                        timeout=10,
+                    )
+                    if detail_resp.status_code == 200:
+                        detail = _decode_response(detail_resp)
+                        return uuid, self._extract_actual_model(detail)
+                except Exception:
+                    pass
+                return uuid, ""
+
+            with ThreadPoolExecutor(max_workers=5) as pool:
+                futures = {pool.submit(_fetch_detail, c): c for c in conversations}
+                for fut in as_completed(futures):
+                    uuid, model = fut.result()
+                    if uuid and model:
+                        enriched[uuid] = model
+
+            debug_info["enriched_count"] = len(enriched)
+            debug_info["enriched_models"] = enriched
+
+            # Set _actual_model on each conversation object
+            for conv in conversations:
+                uuid = conv.get("uuid", "")
+                if uuid in enriched:
+                    conv["_actual_model"] = enriched[uuid]
+
+            debug_info["stage"] = "done"
+            return conversations
+
+        except Exception as exc:
+            debug_info["error"] = str(exc)
+            debug_info["traceback"] = _tb.format_exc()
+            raise
+        finally:
+            try:
+                debug_log.write_text(_json.dumps(debug_info, indent=2, default=str))
+            except Exception:
+                pass
 
     def _refresh(self):
         try:
@@ -1266,6 +1960,12 @@ class ClaudeMonitorApp(rumps.App):
             log_usage(usage)
             rows         = load_history()
             self._stats  = calculate_stats(usage, rows)
+            self._velocity = calc_velocity(rows)
+            self._runway   = calc_runway(usage, self._velocity)
+            self._msg_est  = estimate_messages_remaining(usage, rows)
+            self._suggestion = smart_suggestion(usage, self._stats, self._velocity)
+            # Recent session pcts for sparkline (last ~8 readings)
+            self._recent_session_pcts = [r[1] for r in rows[-8:]] if rows else []
             try:
                 self._conversations = self._fetch_conversations_data()
             except Exception:
@@ -1285,8 +1985,16 @@ class ClaudeMonitorApp(rumps.App):
 
         # Reset session keys when session resets_at changes
         if sreset != self._last_session_reset:
+            old_reset = self._last_session_reset
             self._notified = {k for k in self._notified if not k.startswith("session_")}
             self._last_session_reset = sreset
+            # Notify on new session (but not on first launch)
+            if old_reset is not None and sreset:
+                rumps.notification(
+                    "ClaudeWatch",
+                    "New session started",
+                    "Fresh 5-hour window — slate is clean.",
+                )
 
         sr = _fmt_reset(sreset)
         wr = _fmt_reset(usage.get("weekly_resets_at", ""))
@@ -1327,10 +2035,16 @@ class ClaudeMonitorApp(rumps.App):
             self._set_tooltip(f"ClaudeWatch — error\n{error[:120]}")
             return
 
-        self.title = _build_title(usage, self.config)
+        velocity = getattr(self, "_velocity", None)
+        runway   = getattr(self, "_runway", None)
+        msg_est  = getattr(self, "_msg_est", None)
+        suggestion = getattr(self, "_suggestion", None)
+        recent_pcts = getattr(self, "_recent_session_pcts", None)
+
+        self.title = _build_title(usage, self.config, velocity, recent_pcts)
 
         if self.config.get("show_hover_tooltip", True):
-            self._set_tooltip(_build_tooltip(usage))
+            self._set_tooltip(_build_tooltip(usage, velocity, runway, msg_est))
         else:
             self._set_tooltip("")
 
@@ -1341,12 +2055,29 @@ class ClaudeMonitorApp(rumps.App):
 
         self.menu[session_header].title = f"⬤  Session (5h) — {spct:.1f}%"
         self.menu[session_detail].title = f"   resets in {sreset}" if sreset else "   —"
+
+        # Session runway
+        if runway and runway.get("session_runway_min") is not None:
+            sr_run = _fmt_runway(runway["session_runway_min"])
+            self.menu["   session_runway"].title = f"   ⏱ limit in ~{sr_run} at this pace"
+            self.menu["   session_runway"].hidden = False
+        else:
+            self.menu["   session_runway"].hidden = True
+
         self.menu[weekly_header].title  = f"⬤  Weekly (7d) — {wpct:.1f}%"
 
         if wreset:
             self.menu[weekly_detail].title = f"   resets in {wreset}"
         else:
             self.menu[weekly_detail].title = "   —  "
+
+        # Weekly runway
+        if runway and runway.get("weekly_runway_min") is not None:
+            wr_run = _fmt_runway(runway["weekly_runway_min"])
+            self.menu["   weekly_runway"].title = f"   ⏱ limit in ~{wr_run} at this pace"
+            self.menu["   weekly_runway"].hidden = False
+        else:
+            self.menu["   weekly_runway"].hidden = True
 
         # Per-model breakdowns (combined sub-line in weekly section)
         per_model = usage.get("per_model", {})
@@ -1375,6 +2106,34 @@ class ClaudeMonitorApp(rumps.App):
             self.menu["   extra_credits"].hidden = False
         else:
             self.menu["   extra_credits"].hidden = True
+
+        # Velocity line
+        if velocity and velocity["session_velocity"] > 0.1:
+            self.menu["   velocity_line"].title = (
+                f"   🔥 Burning {velocity['session_velocity']:.1f}%/hr session"
+                f" · {velocity['weekly_velocity']:.1f}%/hr weekly"
+            )
+            self.menu["   velocity_line"].hidden = False
+        else:
+            self.menu["   velocity_line"].hidden = True
+
+        # Messages remaining
+        if msg_est:
+            self.menu["   msgs_remaining"].title = (
+                f"   ~{msg_est['session_msgs_left']} msgs left in session"
+                f" · ~{msg_est['weekly_msgs_left']} this week"
+            )
+            self.menu["   msgs_remaining"].hidden = False
+        else:
+            self.menu["   msgs_remaining"].hidden = True
+
+        # Smart suggestion
+        if suggestion:
+            emoji, text = suggestion
+            self.menu["   suggestion_line"].title = f"   {emoji} {text}"
+            self.menu["   suggestion_line"].hidden = False
+        else:
+            self.menu["   suggestion_line"].hidden = True
 
 
 # ─── Entry point ─────────────────────────────────────────────────────────────

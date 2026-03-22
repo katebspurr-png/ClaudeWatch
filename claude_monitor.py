@@ -46,7 +46,10 @@ DEFAULT_CONFIG = {
     "show_reset_time":    False,
     "show_hover_tooltip": True,
     "notifications_enabled": True,
+    "display_size":       "full",       # "full", "compact", or "minimal"
 }
+
+DISPLAY_SIZE_OPTIONS = ["full", "compact", "minimal"]
 
 CREDITS_PER_DOLLAR = 100   # 1 credit = $0.01 (confirmed against billing)
 SESSION_THRESHOLDS = [75, 90]   # % session usage to notify at
@@ -1551,33 +1554,40 @@ def _sparkline(values, width=6):
 def _build_title(usage, config, velocity=None, recent_session_pcts=None):
     if usage is None:
         return "!"
+    display_size = config.get("display_size", "full")
+    # Minimal mode: icon only, no text
+    if display_size == "minimal":
+        return ""
     parts = []
     if config.get("show_session_pct"):
         s_str = f"{usage['session_pct']:.0f}%"
-        if velocity and abs(velocity["session_delta"]) >= 0.1:
-            d = velocity["session_delta"]
-            s_str += f"+{d:.0f}" if d > 0 else f"{d:.0f}"
-        # Sparkline of recent session readings
-        if recent_session_pcts and len(recent_session_pcts) >= 3:
-            s_str += _sparkline(recent_session_pcts)
+        if display_size == "full":
+            if velocity and abs(velocity["session_delta"]) >= 0.1:
+                d = velocity["session_delta"]
+                s_str += f"+{d:.0f}" if d > 0 else f"{d:.0f}"
+            # Sparkline of recent session readings
+            if recent_session_pcts and len(recent_session_pcts) >= 3:
+                s_str += _sparkline(recent_session_pcts)
         parts.append(s_str)
     if config.get("show_weekly_pct"):
         w_str = f"{usage['weekly_pct']:.0f}%"
-        if velocity and abs(velocity["weekly_delta"]) >= 0.1:
-            d = velocity["weekly_delta"]
-            w_str += f"+{d:.0f}" if d > 0 else f"{d:.0f}"
+        if display_size == "full":
+            if velocity and abs(velocity["weekly_delta"]) >= 0.1:
+                d = velocity["weekly_delta"]
+                w_str += f"+{d:.0f}" if d > 0 else f"{d:.0f}"
         parts.append(w_str)
     title = " | ".join(parts) if parts else "◈"
-    if config.get("show_reset_time"):
-        reset = _fmt_reset(usage.get("session_resets_at", ""))
-        if reset:
-            title += f"  ↺{reset}"
-    extra_pct = usage.get("extra_pct")
-    if extra_pct is not None and usage.get("extra_enabled"):
-        if extra_pct >= 95:
-            title += " 🚨"
-        elif extra_pct >= 80:
-            title += " ⚠️"
+    if display_size == "full":
+        if config.get("show_reset_time"):
+            reset = _fmt_reset(usage.get("session_resets_at", ""))
+            if reset:
+                title += f"  ↺{reset}"
+        extra_pct = usage.get("extra_pct")
+        if extra_pct is not None and usage.get("extra_enabled"):
+            if extra_pct >= 95:
+                title += " 🚨"
+            elif extra_pct >= 80:
+                title += " ⚠️"
     return title
 
 
@@ -1654,12 +1664,24 @@ class ClaudeMonitorApp(rumps.App):
         self._s_notif   = rumps.MenuItem("Notifications",  callback=self._toggle("notifications_enabled"))
         self._sync_checkmarks()
 
+        # Display size submenu
+        self._display_size_items = {}
+        display_size_menu = rumps.MenuItem("Display size")
+        size_labels = {"full": "Full — all details", "compact": "Compact — % only", "minimal": "Minimal — icon only"}
+        for size_key in DISPLAY_SIZE_OPTIONS:
+            item = rumps.MenuItem(size_labels[size_key], callback=self._set_display_size(size_key))
+            self._display_size_items[size_key] = item
+            display_size_menu.add(item)
+        self._sync_display_size_checkmark()
+
         settings = rumps.MenuItem("Settings")
         settings.update([
             rumps.MenuItem("Show in menu bar:", callback=None),
             self._s_session,
             self._s_weekly,
             self._s_reset,
+            None,
+            display_size_menu,
             None,
             self._s_tooltip,
             self._s_notif,
@@ -1762,6 +1784,22 @@ class ClaudeMonitorApp(rumps.App):
         self._s_reset.state   = int(bool(self.config.get("show_reset_time",    False)))
         self._s_tooltip.state = int(bool(self.config.get("show_hover_tooltip", True)))
         self._s_notif.state   = int(bool(self.config.get("notifications_enabled", True)))
+
+    # ── Display size ──
+
+    def _set_display_size(self, size_key):
+        def callback(_):
+            self.config["display_size"] = size_key
+            save_config(self.config)
+            self._sync_display_size_checkmark()
+            if self._usage:
+                self._apply_ui(self._usage)
+        return callback
+
+    def _sync_display_size_checkmark(self):
+        current = self.config.get("display_size", "full")
+        for key, item in self._display_size_items.items():
+            item.state = int(key == current)
 
     # ── Tooltip ──
 

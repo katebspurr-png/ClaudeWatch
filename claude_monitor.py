@@ -165,7 +165,7 @@ def _make_session(cookies):
                       "AppleWebKit/537.36 (KHTML, like Gecko) "
                       "Chrome/131.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
-        "Accept-Encoding": "gzip, deflate" if not ZSTD_OK else "gzip, deflate, zstd",
+        "Accept-Encoding": "gzip, deflate",
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": "https://claude.ai/",
         "Origin": "https://claude.ai",

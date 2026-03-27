@@ -96,6 +96,39 @@ tail -f ~/.claude_monitor/stderr.log
 
 ---
 
+## Updating from the Repo
+
+After pulling new changes, update the running app and optionally rebuild the `.app` bundle.
+
+**1. Pull the latest code:**
+```bash
+cd ~/Library/Mobile\ Documents/com~apple~CloudDocs/ClaudeWatch
+git pull origin main
+```
+
+**2. Update the running script:**
+```bash
+cp claude_monitor.py ~/.claude_monitor/claude_monitor.py
+```
+
+**3. Restart the app:**
+```bash
+~/.claude_monitor/venv/bin/python3 ~/.claude_monitor/claude_monitor.py &
+```
+
+**4. Rebuild the .app bundle (optional):**
+```bash
+python3 -m venv buildenv
+source buildenv/bin/activate
+pip install py2app setuptools rumps requests pycryptodome zstandard
+python3 setup.py py2app
+deactivate
+```
+
+The rebuilt app will be at `dist/ClaudeWatch.app`. First launch: **right-click > Open > Open** to bypass Gatekeeper.
+
+---
+
 ## Files
 
 | File | Purpose |

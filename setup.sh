@@ -65,7 +65,7 @@ read -p "🚀 Start Claude Monitor at login? (y/n): " AUTO_START
 
 if [ "$AUTO_START" = "y" ] || [ "$AUTO_START" = "Y" ]; then
     PLIST_DIR="$HOME/Library/LaunchAgents"
-    PLIST_FILE="$PLIST_DIR/com.claude.monitor.plist"
+    PLIST_FILE="$PLIST_DIR/com.katespurr.claudewatch.plist"
     mkdir -p "$PLIST_DIR"
 
     cat > "$PLIST_FILE" << EOF
@@ -75,7 +75,7 @@ if [ "$AUTO_START" = "y" ] || [ "$AUTO_START" = "Y" ]; then
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.claude.monitor</string>
+    <string>com.katespurr.claudewatch</string>
     <key>ProgramArguments</key>
     <array>
         <string>$PYTHON_BIN</string>

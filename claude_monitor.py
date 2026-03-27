@@ -144,15 +144,18 @@ def get_claude_cookies():
 
 def _decode_response(resp):
     """Decode API response, handling zstd compression."""
-    if resp.headers.get("Content-Encoding") == "zstd":
-        if not ZSTD_OK:
-            raise RuntimeError(
-                "Server sent zstd response but zstandard is not installed. "
-                "Run: pip install zstandard"
-            )
+    # Try standard JSON first — requests/urllib3 may have already decompressed
+    try:
+        return resp.json()
+    except (ValueError, Exception):
+        pass
+    # Fall back to manual zstd decompression
+    if ZSTD_OK:
         dctx = zstandard.ZstdDecompressor()
         return json.loads(dctx.decompress(resp.content))
-    return resp.json()
+    raise RuntimeError(
+        "Could not decode API response. Install zstandard: pip install zstandard"
+    )
 
 
 def _make_session(cookies):

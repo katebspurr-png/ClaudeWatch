@@ -85,13 +85,13 @@ Response:
 
 ```bash
 # Stop
-launchctl unload ~/Library/LaunchAgents/com.katespurr.claudemonitor.plist
+launchctl unload ~/Library/LaunchAgents/com.katespurr.claudewatch.plist
 
 # Start
-launchctl load ~/Library/LaunchAgents/com.katespurr.claudemonitor.plist
+launchctl load ~/Library/LaunchAgents/com.katespurr.claudewatch.plist
 
 # Logs
-tail -f ~/.claude_monitor/monitor.log
+tail -f ~/.claude_monitor/stderr.log
 ```
 
 ---

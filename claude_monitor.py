@@ -99,14 +99,18 @@ def _get_conversation_model(conv):
     if not model_id:
         model_id = conv.get("model") or ""
 
+    import re as _re
     if model_id in MODEL_DISPLAY:
         return model_id, MODEL_DISPLAY[model_id]
     # Strip trailing date suffix (e.g. "claude-sonnet-4-6-20251101" → "claude-sonnet-4-6")
-    import re as _re
     base_id = _re.sub(r"-\d{8}$", "", model_id)
     display = MODEL_DISPLAY.get(base_id) or MODEL_DISPLAY.get(model_id)
     if not display:
-        display = "—" if not model_id else base_id.split("-")[-1].title()
+        # Bare date-only IDs (e.g. "20251101") can't be meaningfully displayed
+        if _re.match(r"^\d{8}$", model_id):
+            display = "—"
+        else:
+            display = base_id.split("-")[-1].title() if base_id else "—"
     return model_id, display
 
 
@@ -1893,10 +1897,11 @@ class ClaudeMonitorApp(rumps.App):
         to conversation-level fields like model_override or settings.model.
         """
         # Check last assistant message first (most accurate)
+        # Prefer model_slug (e.g. "claude-sonnet-4-6") over model which can be a bare date ("20251101")
         msgs = detail.get("chat_messages") or []
         for msg in reversed(msgs):
             if msg.get("sender") == "assistant":
-                m = msg.get("model")
+                m = msg.get("model_slug") or msg.get("model")
                 if m:
                     return m
                 break

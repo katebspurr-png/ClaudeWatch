@@ -99,7 +99,15 @@ def _get_conversation_model(conv):
     if not model_id:
         model_id = conv.get("model") or ""
 
-    return model_id, MODEL_DISPLAY.get(model_id, model_id.split("-")[-1].title() if model_id else "—")
+    if model_id in MODEL_DISPLAY:
+        return model_id, MODEL_DISPLAY[model_id]
+    # Strip trailing date suffix (e.g. "claude-sonnet-4-6-20251101" → "claude-sonnet-4-6")
+    import re as _re
+    base_id = _re.sub(r"-\d{8}$", "", model_id)
+    display = MODEL_DISPLAY.get(base_id) or MODEL_DISPLAY.get(model_id)
+    if not display:
+        display = "—" if not model_id else base_id.split("-")[-1].title()
+    return model_id, display
 
 
 # ─── Cookie decryption ───────────────────────────────────────────────────────

@@ -47,9 +47,10 @@ DEFAULT_CONFIG = {
     "show_hover_tooltip": True,
     "notifications_enabled": True,
     "display_size":       "full",       # "full", "compact", or "minimal"
+    "show_sparkline":     True,
 }
 
-DISPLAY_SIZE_OPTIONS = ["full", "compact", "minimal"]
+DISPLAY_SIZE_OPTIONS = ["full", "compact", "minimal", "custom"]
 
 CREDITS_PER_DOLLAR = 100   # 1 credit = $0.01 (confirmed against billing)
 SESSION_THRESHOLDS = [75, 90]   # % session usage to notify at
@@ -1561,30 +1562,31 @@ def _build_title(usage, config, velocity=None, recent_session_pcts=None):
     # Minimal mode: icon only, no text
     if display_size == "minimal":
         return ""
+    full_detail = display_size in ("full", "custom")
     parts = []
     if config.get("show_session_pct"):
         s_str = f"{usage['session_pct']:.0f}%"
-        if display_size == "full":
+        if full_detail:
             if velocity and abs(velocity["session_delta"]) >= 0.1:
                 d = velocity["session_delta"]
                 s_str += f"+{d:.0f}" if d > 0 else f"{d:.0f}"
-            # Sparkline of recent session readings
-            if recent_session_pcts and len(recent_session_pcts) >= 3:
-                s_str += _sparkline(recent_session_pcts)
         parts.append(s_str)
     if config.get("show_weekly_pct"):
         w_str = f"{usage['weekly_pct']:.0f}%"
-        if display_size == "full":
+        if full_detail:
             if velocity and abs(velocity["weekly_delta"]) >= 0.1:
                 d = velocity["weekly_delta"]
                 w_str += f"+{d:.0f}" if d > 0 else f"{d:.0f}"
         parts.append(w_str)
     title = " | ".join(parts) if parts else "◈"
-    if display_size == "full":
+    if full_detail:
         if config.get("show_reset_time"):
             reset = _fmt_reset(usage.get("session_resets_at", ""))
             if reset:
                 title += f"  ↺{reset}"
+        # Sparkline appended last so it doesn't push reset time off screen
+        if config.get("show_sparkline", True) and config.get("show_session_pct") and recent_session_pcts and len(recent_session_pcts) >= 3:
+            title += _sparkline(recent_session_pcts)
         extra_pct = usage.get("extra_pct")
         if extra_pct is not None and usage.get("extra_enabled"):
             if extra_pct >= 95:
@@ -1631,8 +1633,8 @@ def _build_tooltip(usage, velocity=None, runway=None, msg_est=None):
     eu = usage.get("extra_used")
     el = usage.get("extra_limit")
     if eu is not None and el:
-        extra_pct = usage.get("extra_pct", 0)
-        warn = "⚠️ " if extra_pct and extra_pct >= 90 else ""
+        extra_pct = usage.get("extra_pct") or 0
+        warn = "⚠️ " if extra_pct >= 90 else ""
         lines.append(f"{warn}Extra usage:  ${eu/CREDITS_PER_DOLLAR:.2f} / ${el/CREDITS_PER_DOLLAR:.2f} ({extra_pct:.0f}%)")
     return "\n".join(lines)
 
@@ -1660,19 +1662,21 @@ class ClaudeMonitorApp(rumps.App):
             init_db()
 
         # Settings checkmark items
-        self._s_session = rumps.MenuItem("Session % (5h)", callback=self._toggle("show_session_pct"))
-        self._s_weekly  = rumps.MenuItem("Weekly % (7d)",  callback=self._toggle("show_weekly_pct"))
-        self._s_reset   = rumps.MenuItem("Reset time",     callback=self._toggle("show_reset_time"))
-        self._s_tooltip = rumps.MenuItem("Hover tooltip",  callback=self._toggle("show_hover_tooltip"))
-        self._s_notif   = rumps.MenuItem("Notifications",  callback=self._toggle("notifications_enabled"))
+        self._s_session   = rumps.MenuItem("Session % (5h)", callback=self._toggle("show_session_pct"))
+        self._s_weekly    = rumps.MenuItem("Weekly % (7d)",  callback=self._toggle("show_weekly_pct"))
+        self._s_reset     = rumps.MenuItem("Reset time",     callback=self._toggle("show_reset_time"))
+        self._s_sparkline = rumps.MenuItem("Sparkline",      callback=self._toggle("show_sparkline"))
+        self._s_tooltip   = rumps.MenuItem("Hover tooltip",  callback=self._toggle("show_hover_tooltip"))
+        self._s_notif     = rumps.MenuItem("Notifications",  callback=self._toggle("notifications_enabled"))
         self._sync_checkmarks()
 
         # Display size submenu
         self._display_size_items = {}
         display_size_menu = rumps.MenuItem("Display size")
-        size_labels = {"full": "Full — all details", "compact": "Compact — % only", "minimal": "Minimal — icon only"}
+        size_labels = {"full": "Full — all details", "compact": "Compact — % only", "minimal": "Minimal — icon only", "custom": "Custom"}
         for size_key in DISPLAY_SIZE_OPTIONS:
-            item = rumps.MenuItem(size_labels[size_key], callback=self._set_display_size(size_key))
+            cb = None if size_key == "custom" else self._set_display_size(size_key)
+            item = rumps.MenuItem(size_labels[size_key], callback=cb)
             self._display_size_items[size_key] = item
             display_size_menu.add(item)
         self._sync_display_size_checkmark()
@@ -1683,6 +1687,7 @@ class ClaudeMonitorApp(rumps.App):
             self._s_session,
             self._s_weekly,
             self._s_reset,
+            self._s_sparkline,
             None,
             display_size_menu,
             None,
@@ -1757,6 +1762,7 @@ class ClaudeMonitorApp(rumps.App):
             refresh_menu,
             rumps.MenuItem("Refresh Now",        callback=self.manual_refresh),
             None,
+            rumps.MenuItem("Restart",            callback=self.restart_app),
             rumps.MenuItem("Quit",               callback=self.quit_app),
         ]
 
@@ -1775,26 +1781,41 @@ class ClaudeMonitorApp(rumps.App):
     def _toggle(self, key):
         def callback(_):
             self.config[key] = not self.config.get(key, True)
+            # Auto-detect preset match, or fall back to "custom"
+            _preset_keys = ("show_session_pct", "show_weekly_pct", "show_reset_time", "show_sparkline")
+            current = {k: bool(self.config.get(k)) for k in _preset_keys}
+            matched = next((s for s, p in self._DISPLAY_SIZE_PRESETS.items() if p == current), "custom")
+            self.config["display_size"] = matched
             save_config(self.config)
             self._sync_checkmarks()
+            self._sync_display_size_checkmark()
             if self._usage:
                 self._apply_ui(self._usage)
         return callback
 
     def _sync_checkmarks(self):
-        self._s_session.state = int(bool(self.config.get("show_session_pct",   True)))
-        self._s_weekly.state  = int(bool(self.config.get("show_weekly_pct",    True)))
-        self._s_reset.state   = int(bool(self.config.get("show_reset_time",    False)))
-        self._s_tooltip.state = int(bool(self.config.get("show_hover_tooltip", True)))
-        self._s_notif.state   = int(bool(self.config.get("notifications_enabled", True)))
+        self._s_session.state   = int(bool(self.config.get("show_session_pct",   True)))
+        self._s_weekly.state    = int(bool(self.config.get("show_weekly_pct",    True)))
+        self._s_reset.state     = int(bool(self.config.get("show_reset_time",    False)))
+        self._s_sparkline.state = int(bool(self.config.get("show_sparkline",     True)))
+        self._s_tooltip.state   = int(bool(self.config.get("show_hover_tooltip", True)))
+        self._s_notif.state     = int(bool(self.config.get("notifications_enabled", True)))
 
     # ── Display size ──
+
+    _DISPLAY_SIZE_PRESETS = {
+        "full":    {"show_session_pct": True,  "show_weekly_pct": True,  "show_reset_time": True,  "show_sparkline": True},
+        "compact": {"show_session_pct": True,  "show_weekly_pct": True,  "show_reset_time": False, "show_sparkline": False},
+        "minimal": {"show_session_pct": False, "show_weekly_pct": False, "show_reset_time": False, "show_sparkline": False},
+    }
 
     def _set_display_size(self, size_key):
         def callback(_):
             self.config["display_size"] = size_key
+            self.config.update(self._DISPLAY_SIZE_PRESETS[size_key])
             save_config(self.config)
             self._sync_display_size_checkmark()
+            self._sync_checkmarks()
             if self._usage:
                 self._apply_ui(self._usage)
         return callback
@@ -1852,6 +1873,10 @@ class ClaudeMonitorApp(rumps.App):
     def quit_app(self, _):
         rumps.quit_application()
 
+    def restart_app(self, _):
+        rumps.notification("ClaudeWatch", "Restarting…", "")
+        rumps.quit_application()
+
     # ── Refresh interval ──
 
     def _set_refresh(self, minutes):
@@ -1875,7 +1900,7 @@ class ClaudeMonitorApp(rumps.App):
         self._timer.start()
 
     def _on_timer(self, _):
-        self._refresh()
+        threading.Thread(target=self._refresh, daemon=True).start()
 
     def _start_timer(self):
         self._restart_timer()
@@ -1905,6 +1930,10 @@ class ClaudeMonitorApp(rumps.App):
         if m:
             return m
         m = detail.get("active_model")
+        if m:
+            return m
+        # Top-level model field (most common in current API)
+        m = detail.get("model")
         if m:
             return m
         return ""

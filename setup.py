@@ -29,8 +29,8 @@ OPTIONS = {
         "LSUIElement": True,          # menu bar only — no Dock icon
         "NSHumanReadableCopyright": "MIT",
     },
-    "packages": ["rumps", "Crypto"],
-    "includes": ["requests", "sqlite3", "hashlib", "subprocess"],
+    "packages": ["rumps", "Crypto", "requests", "zstandard", "urllib3", "certifi", "charset_normalizer", "idna"],
+    "includes": ["sqlite3", "hashlib", "subprocess"],
 }
 
 setup(

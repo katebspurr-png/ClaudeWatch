@@ -16,6 +16,8 @@ from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
 try:
+    import warnings as _warnings
+    _warnings.filterwarnings("ignore", message="Unable to find acceptable character detection")
     import requests
     from Crypto.Cipher import AES
     DEPS_OK = True
@@ -35,7 +37,14 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 DB_PATH     = CONFIG_DIR / "history.db"
 DASH_PATH   = CONFIG_DIR / "dashboard.html"
 COOKIES_DB  = Path.home() / "Library/Application Support/Claude/Cookies"
-ICON_PATH   = str(CONFIG_DIR / "TrayIconTemplate.png")
+
+# When running as a py2app bundle the icon lives inside the .app Resources
+# directory; otherwise it's copied to ~/.claude_monitor/ by setup.sh.
+import sys as _sys
+if getattr(_sys, 'frozen', False):
+    ICON_PATH = str(Path(_sys.executable).parent.parent / "Resources" / "TrayIconTemplate.png")
+else:
+    ICON_PATH = str(CONFIG_DIR / "TrayIconTemplate.png")
 
 CLAUDE_USAGE_URL = "https://claude.ai/settings/usage"
 
@@ -1786,6 +1795,50 @@ class ClaudeMonitorApp(rumps.App):
         if DEPS_OK:
             self._start_timer()
             threading.Thread(target=self._refresh, daemon=True).start()
+
+        # First-run: offer login item when running as bundled .app
+        if getattr(_sys, 'frozen', False):
+            _plist = Path.home() / "Library/LaunchAgents/com.katespurr.claudewatch.plist"
+            if not _plist.exists():
+                self._first_run_timer = rumps.Timer(self._prompt_login_item, 1.5)
+                self._first_run_timer.start()
+
+    def _prompt_login_item(self, timer):
+        timer.stop()
+        response = rumps.alert(
+            title="Welcome to ClaudeWatch",
+            message="Start ClaudeWatch automatically when you log in?",
+            ok="Yes, start at login",
+            cancel="Not now",
+        )
+        if response == 1:
+            executable = Path(_sys.executable).parent / "ClaudeWatch"
+            plist_file = Path.home() / "Library/LaunchAgents/com.katespurr.claudewatch.plist"
+            plist_file.parent.mkdir(parents=True, exist_ok=True)
+            plist_file.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.katespurr.claudewatch</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{executable}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{CONFIG_DIR}/stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>{CONFIG_DIR}/stderr.log</string>
+</dict>
+</plist>""")
+            subprocess.run(["launchctl", "load", str(plist_file)], check=False)
+            rumps.notification("ClaudeWatch", "Login item installed",
+                               "ClaudeWatch will start automatically at login.")
 
     # ── Settings ──
 

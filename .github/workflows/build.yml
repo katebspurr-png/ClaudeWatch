@@ -1,0 +1,64 @@
+name: Build and Release DMG
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write   # required to create releases and upload assets
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install build dependencies
+        run: |
+          pip install --upgrade pip
+          pip install py2app rumps requests pycryptodome zstandard
+
+      - name: Set version from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          sed -i '' "s/\"CFBundleVersion\": \"[^\"]*\"/\"CFBundleVersion\": \"$VERSION\"/" setup.py
+          sed -i '' "s/\"CFBundleShortVersionString\": \"[^\"]*\"/\"CFBundleShortVersionString\": \"$VERSION\"/" setup.py
+
+      - name: Build .app
+        run: python setup.py py2app
+
+      - name: Create DMG
+        run: |
+          TMP_DIR=$(mktemp -d)
+          cp -r dist/ClaudeWatch.app "$TMP_DIR/"
+          ln -s /Applications "$TMP_DIR/Applications"
+          hdiutil create \
+            -volname "ClaudeWatch" \
+            -srcfolder "$TMP_DIR" \
+            -ov -format UDZO \
+            "ClaudeWatch-${{ env.VERSION }}.dmg"
+          rm -rf "$TMP_DIR"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ClaudeWatch-${{ env.VERSION }}.dmg
+          generate_release_notes: true
+          body: |
+            ## Install
+
+            1. Download **ClaudeWatch-${{ env.VERSION }}.dmg**
+            2. Open the DMG and drag **ClaudeWatch** to your Applications folder
+            3. Right-click → **Open** on first launch (required — app is unsigned)
+            4. ClaudeWatch will ask if you'd like it to start automatically at login
+
+            **Requirements:** macOS · Claude desktop app installed and signed in

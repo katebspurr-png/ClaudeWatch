@@ -5,8 +5,9 @@ dist/
 # Python cache
 __pycache__/
 
-# Virtual environment
+# Virtual environments
 venv/
+.build_venv/
 
 # macOS
 .DS_Store

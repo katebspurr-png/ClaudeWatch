@@ -70,7 +70,9 @@ MODEL_DISPLAY = {
     "claude-opus-4-6-20250514":   "Opus 4.6",
     "claude-haiku-4-5-20251001":  "Haiku 4.5",
     "claude-sonnet-4-5-20241022": "Sonnet 4.5",
+    "claude-sonnet-4-5-20250929": "Sonnet 4.5",
     "claude-opus-4-5-20250115":   "Opus 4.5",
+    "claude-opus-4-5-20251101":   "Opus 4.5",
     # Older model IDs
     "claude-3-5-sonnet-20241022": "Sonnet 3.5",
     "claude-3-5-haiku-20241022":  "Haiku 3.5",
@@ -100,7 +102,16 @@ def _get_conversation_model(conv):
     if not model_id:
         model_id = conv.get("model") or ""
 
-    return model_id, MODEL_DISPLAY.get(model_id, model_id.split("-")[-1].title() if model_id else "—")
+    if not model_id:
+        return model_id, "—"
+    if model_id in MODEL_DISPLAY:
+        return model_id, MODEL_DISPLAY[model_id]
+    # Strip trailing date suffix (YYYYMMDD) and try again
+    import re as _re
+    base = _re.sub(r"-\d{8}$", "", model_id)
+    if base in MODEL_DISPLAY:
+        return model_id, MODEL_DISPLAY[base]
+    return model_id, model_id.split("-")[-1].title()
 
 
 # ─── Cookie decryption ───────────────────────────────────────────────────────

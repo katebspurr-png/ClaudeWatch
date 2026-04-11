@@ -210,6 +210,44 @@
       .pain-grid { grid-template-columns: 1fr; }
     }
 
+    /* ── Solution ── */
+    .solution-inner {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 4rem;
+      align-items: center;
+    }
+    .solution-copy h2 { margin-bottom: 1rem; }
+    .solution-copy p  { margin-bottom: 1.5rem; }
+    .feature-list {
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 0.6rem;
+    }
+    .feature-list li {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      font-size: 0.95rem;
+      color: var(--text);
+    }
+    .feature-list li::before {
+      content: '';
+      width: 6px;
+      height: 6px;
+      background: var(--accent);
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    @media (max-width: 720px) {
+      .solution-inner {
+        grid-template-columns: 1fr;
+        gap: 2rem;
+      }
+      .solution-image { order: -1; }
+    }
+
     /* ── Responsive ── */
     @media (max-width: 640px) {
       section { padding: 3rem 0; }
@@ -273,7 +311,28 @@
       </div>
     </div>
   </section>
-  <!-- SOLUTION (Task 6) -->
+  <!-- SOLUTION -->
+  <section class="solution">
+    <div class="container">
+      <div class="solution-inner">
+        <div class="solution-image">
+          <img src="screenshots/dropdown.png" alt="ClaudeWatch dropdown showing session usage, weekly usage, and reset time" class="screenshot">
+        </div>
+        <div class="solution-copy">
+          <p class="eyebrow">The fix</p>
+          <h2>Now you always know.</h2>
+          <p>ClaudeWatch sits in your menu bar and polls your usage every few minutes. Session usage. Weekly usage. Time until reset. All there, at a glance. No surprises.</p>
+          <ul class="feature-list">
+            <li>5-hour session usage %</li>
+            <li>7-day weekly usage %</li>
+            <li>Time until session resets</li>
+            <li>Model guide — what to use when</li>
+            <li>Usage history &amp; analytics dashboard</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
   <!-- HOW IT WORKS (Task 7) -->
   <!-- CTA (Task 8) -->
 

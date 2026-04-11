@@ -155,6 +155,42 @@
     .nav-links a:hover { color: var(--text); }
 
     /* ── Responsive ── */
+    /* ── Hero ── */
+    .hero { padding: 6rem 0 4rem; }
+    .hero-inner {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 4rem;
+      align-items: center;
+    }
+    .eyebrow {
+      font-size: 0.75rem;
+      font-weight: 600;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--accent);
+      margin-bottom: 1.25rem;
+    }
+    .hero h1 { margin-bottom: 1.25rem; }
+    .hero-sub {
+      font-size: 1.15rem;
+      margin-bottom: 2rem;
+    }
+    .hero-actions {
+      display: flex;
+      gap: 1.25rem;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    @media (max-width: 720px) {
+      .hero-inner {
+        grid-template-columns: 1fr;
+        gap: 2.5rem;
+      }
+      .hero { padding: 3rem 0 2rem; }
+    }
+
+    /* ── Responsive ── */
     @media (max-width: 640px) {
       section { padding: 3rem 0; }
       .nav-links { display: none; }
@@ -176,7 +212,25 @@
     </div>
   </nav>
 
-  <!-- HERO (Task 4) -->
+  <!-- HERO -->
+  <section class="hero">
+    <div class="container">
+      <div class="hero-inner">
+        <div class="hero-copy">
+          <p class="eyebrow">ClaudeWatch for Mac</p>
+          <h1>You're flying blind on Claude limits.</h1>
+          <p class="hero-sub">Claude cuts you off mid-project and you never see it coming. ClaudeWatch puts your session and weekly usage right in the menu bar — always visible, always current.</p>
+          <div class="hero-actions">
+            <a href="https://claudewatch.gumroad.com/l/download" class="btn-primary">Download · pay what you can</a>
+            <a href="https://github.com/katebspurr-png/ClaudeWatch" class="btn-ghost">Free on GitHub →</a>
+          </div>
+        </div>
+        <div class="hero-image">
+          <img src="screenshots/menubar.png" alt="ClaudeWatch showing 34% | 64% in the Mac menu bar" class="screenshot">
+        </div>
+      </div>
+    </div>
+  </section>
   <!-- PAIN (Task 5) -->
   <!-- SOLUTION (Task 6) -->
   <!-- HOW IT WORKS (Task 7) -->

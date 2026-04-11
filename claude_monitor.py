@@ -1198,7 +1198,7 @@ def generate_dashboard(usage, stats, conversations=None):
               label: 'Weekly %',
               data: {chart_values},
               borderColor: '#0D9488',
-              backgroundColor: 'rgba(217,119,87,0.1)',
+              backgroundColor: 'rgba(13,148,136,0.1)',
               borderWidth: 2,
               pointRadius: 2,
               fill: true,
@@ -1385,7 +1385,7 @@ def generate_dashboard(usage, stats, conversations=None):
   .conv-table{{width:100%;border-collapse:collapse;font-size:.85rem}}
   .conv-table th{{text-align:left;color:var(--muted);font-weight:600;padding:8px 6px;border-bottom:2px solid var(--border)}}
   .conv-table td{{padding:8px 6px;border-bottom:1px solid var(--border)}}
-  .conv-table tr:hover td{{background:rgba(217,119,87,0.05)}}
+  .conv-table tr:hover td{{background:rgba(13,148,136,0.05)}}
   .conv-table a{{color:var(--accent);text-decoration:none}}
   .conv-table a:hover{{text-decoration:underline}}
 </style>

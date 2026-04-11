@@ -14,12 +14,26 @@ A single-page static landing page for ClaudeWatch hosted on Netlify or Vercel. D
 
 ## Visual Direction
 
-- **Background:** #0a0a0f (near-black)
-- **Accent:** #6c47ff (purple, matches Claude's brand)
-- **Text:** white / #888 secondary
-- **Typography:** system-ui, bold headlines
-- **Images:** real screenshots of ClaudeWatch (menu bar icon + dropdown)
-- **Layout:** single-page, vertical scroll, responsive (desktop + mobile)
+The landing page and the in-app dashboard share a visual language — same tokens, same card style, same font stack. Someone who's used the dashboard should feel at home on the website immediately.
+
+**Design principle:** Deliberately avoid the purple/indigo palette saturating AI tools. Teal is ClaudeWatch's own identity — technical, distinct, nothing like Anthropic or the dozen other Claude utilities out there.
+
+**Shared design tokens (applied to both landing page and dashboard):**
+- **Accent:** `#0D9488` (teal — bars, CTAs, highlights, left-borders)
+- **Font:** `-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif`
+- **Card style:** rounded corners (12px), subtle `1px` border, surface background
+- **Muted text:** `#9ca3af` (dark mode) / `#6b7280` (light mode)
+
+**Dark palette (landing page and dashboard dark mode):**
+- **Hero background:** `#0a0a0f` (richer dark for dramatic hero)
+- **Card/surface background:** `#1c1c1e`
+- **Border:** `#2d2d2d`
+- **Text:** `#f5f5f5` / `#9ca3af` secondary
+
+**Note:** The dashboard currently uses `#D97757` (orange). As part of this work, the dashboard accent will be updated to `#0D9488` to match the new brand identity.
+
+**Images:** real screenshots of ClaudeWatch (menu bar icon + dropdown)  
+**Layout:** single-page, vertical scroll, responsive (desktop + mobile)
 
 ---
 
@@ -32,7 +46,7 @@ A single-page static landing page for ClaudeWatch hosted on Netlify or Vercel. D
 **Subhead:** Claude cuts you off mid-project and you never see it coming. ClaudeWatch puts your session and weekly usage right in the menu bar — always visible, always current.
 
 **CTAs (side by side):**
-- Primary: `Download · pay what you can` → Gumroad (purple button)
+- Primary: `Download · pay what you can` → Gumroad (teal button)
 - Secondary: `Free on GitHub →` (text/ghost link)
 
 **Visual:** Screenshot of the menu bar showing the ClaudeWatch title string (e.g., `34% | 64%`), beside or below copy on desktop, stacked on mobile.

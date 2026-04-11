@@ -189,6 +189,27 @@
       .hero { padding: 3rem 0 2rem; }
     }
 
+    /* ── Pain ── */
+    .pain { padding: 0 0 5rem; }
+    .pain-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 1rem;
+    }
+    .pain-card { text-align: center; padding: 2rem 1.5rem; }
+    .pain-icon {
+      font-size: 1.75rem;
+      margin-bottom: 1rem;
+    }
+    .pain-card h3 {
+      margin-bottom: 0.5rem;
+      font-size: 1rem;
+    }
+    .pain-card p { font-size: 0.9rem; }
+    @media (max-width: 640px) {
+      .pain-grid { grid-template-columns: 1fr; }
+    }
+
     /* ── Responsive ── */
     @media (max-width: 640px) {
       section { padding: 3rem 0; }
@@ -230,7 +251,28 @@
       </div>
     </div>
   </section>
-  <!-- PAIN (Task 5) -->
+  <!-- PAIN -->
+  <section class="pain">
+    <div class="container">
+      <div class="pain-grid">
+        <div class="card pain-card">
+          <div class="pain-icon">⏱</div>
+          <h3>You're deep in a project.</h3>
+          <p>Claude slows down. You had no idea you were close to the limit.</p>
+        </div>
+        <div class="card pain-card">
+          <div class="pain-icon">🔍</div>
+          <h3>You go looking for your usage.</h3>
+          <p>It's buried in settings, three clicks deep. By then you've already lost your flow.</p>
+        </div>
+        <div class="card pain-card">
+          <div class="pain-icon">🛑</div>
+          <h3>You hit the limit.</h3>
+          <p>The work stops. You wait. Again.</p>
+        </div>
+      </div>
+    </div>
+  </section>
   <!-- SOLUTION (Task 6) -->
   <!-- HOW IT WORKS (Task 7) -->
   <!-- CTA (Task 8) -->

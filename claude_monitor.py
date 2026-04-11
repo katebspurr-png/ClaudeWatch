@@ -548,7 +548,7 @@ def _per_model_html(usage):
         elif pct >= 60:
             color = "#f59e0b"
         else:
-            color = "#D97757"
+            color = "#0D9488"
         rows += f"""
         <div style="margin-bottom:12px">
           <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px">
@@ -1163,7 +1163,7 @@ def generate_dashboard(usage, stats, conversations=None):
     elif wpct >= 60:
         w_color = "#f59e0b"
     else:
-        w_color = "#D97757"
+        w_color = "#0D9488"
 
     # Projection line
     if stats and stats["projected_full"]:
@@ -1197,7 +1197,7 @@ def generate_dashboard(usage, stats, conversations=None):
             datasets: [{{
               label: 'Weekly %',
               data: {chart_values},
-              borderColor: '#D97757',
+              borderColor: '#0D9488',
               backgroundColor: 'rgba(217,119,87,0.1)',
               borderWidth: 2,
               pointRadius: 2,
@@ -1236,7 +1236,7 @@ def generate_dashboard(usage, stats, conversations=None):
         dow_labels = json.dumps([DOW_SHORT[i] for i in range(7)])
         dow_values = json.dumps([round(patterns.get(i, 0), 2) for i in range(7)])
         dow_colors = json.dumps([
-            "#D97757" if i == max(patterns, key=patterns.get)
+            "#0D9488" if i == max(patterns, key=patterns.get)
             else "#93c5fd" if i == today
             else "#e5e7eb"
             for i in range(7)
@@ -1340,7 +1340,7 @@ def generate_dashboard(usage, stats, conversations=None):
   *{{box-sizing:border-box;margin:0;padding:0}}
   :root{{
     --bg:#f5f5f5;--surface:#fff;--text:#1a1a1a;--muted:#6b7280;
-    --accent:#D97757;--border:#e5e7eb;--radius:12px;
+    --accent:#0D9488;--border:#e5e7eb;--radius:12px;
   }}
   @media(prefers-color-scheme:dark){{
     :root{{--bg:#111;--surface:#1c1c1e;--text:#f5f5f5;--muted:#9ca3af;--border:#2d2d2d}}
@@ -1393,7 +1393,7 @@ def generate_dashboard(usage, stats, conversations=None):
 <body>
 <h1>
   <svg width="20" height="20" viewBox="0 0 100 100" fill="none">
-    <circle cx="50" cy="50" r="48" fill="#D97757"/>
+    <circle cx="50" cy="50" r="48" fill="#0D9488"/>
     <text x="50" y="67" text-anchor="middle" font-size="52" fill="white" font-family="-apple-system">◈</text>
   </svg>
   ClaudeWatch
@@ -1406,7 +1406,7 @@ def generate_dashboard(usage, stats, conversations=None):
   <div class="card">
     <h2>Session Usage (5h)</h2>
     <div class="big">{spct:.0f}%</div>
-    <div class="bar-wrap"><div class="bar" style="width:{min(spct,100):.1f}%;background:#D97757"></div></div>
+    <div class="bar-wrap"><div class="bar" style="width:{min(spct,100):.1f}%;background:#0D9488"></div></div>
     <div class="bar-labels"><span>used</span><span>100%</span></div>
     <div class="reset-badge">{f"resets in {sreset}" if sreset else ""}</div>
   </div>

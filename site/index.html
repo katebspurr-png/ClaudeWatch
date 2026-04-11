@@ -285,6 +285,18 @@
       .step-arrow { transform: rotate(90deg); }
     }
 
+    /* ── Bottom CTA ── */
+    .cta-section { padding: 3rem 0 5rem; }
+    .cta-box {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-top: 3px solid var(--accent);
+      border-radius: var(--radius);
+      padding: 3rem 2rem;
+      text-align: center;
+    }
+    .cta-box h2 { margin-bottom: 0.75rem; }
+
     /* ── Responsive ── */
     @media (max-width: 640px) {
       section { padding: 3rem 0; }
@@ -398,7 +410,19 @@
       </p>
     </div>
   </section>
-  <!-- CTA (Task 8) -->
+  <!-- CTA -->
+  <section class="cta-section">
+    <div class="container">
+      <div class="cta-box">
+        <h2>Stop flying blind.</h2>
+        <p>Pay what you can — or get it free on GitHub.</p>
+        <div class="hero-actions" style="justify-content:center;margin-top:1.5rem">
+          <a href="https://claudewatch.gumroad.com/l/download" class="btn-primary">Download · pay what you can</a>
+          <a href="https://github.com/katebspurr-png/ClaudeWatch" class="btn-ghost">Free on GitHub →</a>
+        </div>
+      </div>
+    </div>
+  </section>
 
   <!-- FOOTER -->
   <footer style="border-top:1px solid var(--border);padding:2rem 0;text-align:center">

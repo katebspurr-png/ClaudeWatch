@@ -30,6 +30,12 @@ try:
 except ImportError:
     ZSTD_OK = False
 
+try:
+    from zoneinfo import ZoneInfo as _ZoneInfo
+    _ZONEINFO_OK = True
+except ImportError:
+    _ZONEINFO_OK = False
+
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 CONFIG_DIR  = Path.home() / ".claude_monitor"
@@ -57,6 +63,7 @@ DEFAULT_CONFIG = {
     "notifications_enabled": True,
     "display_size":       "full",       # "full", "compact", or "minimal"
     "show_sparkline":     True,
+    "peak_off_peak_color": False,       # green off-peak / red peak colour in menu bar
 }
 
 DISPLAY_SIZE_OPTIONS = ["full", "compact", "minimal", "custom"]
@@ -1555,6 +1562,40 @@ a:hover {{ text-decoration: underline; }}
 </table></body></html>"""
 
 
+# ── Peak / off-peak helper ────────────────────────────────────────────────────
+
+def is_peak_hours(dt=None):
+    """Return True if *dt* falls in Anthropic peak hours.
+
+    Peak window: 5 am – 11 am America/Los_Angeles, weekdays only.
+    Weekends are always off-peak.
+
+    Args:
+        dt: A timezone-aware datetime.  Defaults to the current UTC time.
+
+    Returns:
+        bool – True during peak, False off-peak.
+    """
+    if dt is None:
+        dt = datetime.now(timezone.utc)
+
+    # Convert to Pacific Time, honouring DST automatically when possible.
+    if _ZONEINFO_OK:
+        pt = dt.astimezone(_ZoneInfo("America/Los_Angeles"))
+    else:
+        # Rough fallback: PDT (UTC-7) March–November, PST (UTC-8) otherwise.
+        month = dt.astimezone(timezone.utc).month
+        offset = timedelta(hours=-7) if 3 <= month <= 11 else timedelta(hours=-8)
+        pt = dt.astimezone(timezone(offset))
+
+    # Weekends (Saturday=5, Sunday=6) are always off-peak.
+    if pt.weekday() >= 5:
+        return False
+
+    # Peak: 5 am (inclusive) to 11 am (exclusive).
+    return 5 <= pt.hour < 11
+
+
 SPARKLINE_CHARS = "▁▂▃▄▅▆▇█"
 
 
@@ -1682,12 +1723,13 @@ class ClaudeMonitorApp(rumps.App):
             init_db()
 
         # Settings checkmark items
-        self._s_session   = rumps.MenuItem("Session % (5h)", callback=self._toggle("show_session_pct"))
-        self._s_weekly    = rumps.MenuItem("Weekly % (7d)",  callback=self._toggle("show_weekly_pct"))
-        self._s_reset     = rumps.MenuItem("Reset time",     callback=self._toggle("show_reset_time"))
-        self._s_sparkline = rumps.MenuItem("Sparkline",      callback=self._toggle("show_sparkline"))
-        self._s_tooltip   = rumps.MenuItem("Hover tooltip",  callback=self._toggle("show_hover_tooltip"))
-        self._s_notif     = rumps.MenuItem("Notifications",  callback=self._toggle("notifications_enabled"))
+        self._s_session    = rumps.MenuItem("Session % (5h)", callback=self._toggle("show_session_pct"))
+        self._s_weekly     = rumps.MenuItem("Weekly % (7d)",  callback=self._toggle("show_weekly_pct"))
+        self._s_reset      = rumps.MenuItem("Reset time",     callback=self._toggle("show_reset_time"))
+        self._s_sparkline  = rumps.MenuItem("Sparkline",      callback=self._toggle("show_sparkline"))
+        self._s_tooltip    = rumps.MenuItem("Hover tooltip",  callback=self._toggle("show_hover_tooltip"))
+        self._s_notif      = rumps.MenuItem("Notifications",  callback=self._toggle("notifications_enabled"))
+        self._s_peak_color = rumps.MenuItem("Peak/off-peak colour", callback=self._toggle("peak_off_peak_color"))
         self._sync_checkmarks()
 
         # Display size submenu
@@ -1713,6 +1755,8 @@ class ClaudeMonitorApp(rumps.App):
             None,
             self._s_tooltip,
             self._s_notif,
+            None,
+            self._s_peak_color,
         ])
 
         # Model guide submenu
@@ -1858,12 +1902,13 @@ class ClaudeMonitorApp(rumps.App):
         return callback
 
     def _sync_checkmarks(self):
-        self._s_session.state   = int(bool(self.config.get("show_session_pct",   True)))
-        self._s_weekly.state    = int(bool(self.config.get("show_weekly_pct",    True)))
-        self._s_reset.state     = int(bool(self.config.get("show_reset_time",    False)))
-        self._s_sparkline.state = int(bool(self.config.get("show_sparkline",     True)))
-        self._s_tooltip.state   = int(bool(self.config.get("show_hover_tooltip", True)))
-        self._s_notif.state     = int(bool(self.config.get("notifications_enabled", True)))
+        self._s_session.state    = int(bool(self.config.get("show_session_pct",     True)))
+        self._s_weekly.state     = int(bool(self.config.get("show_weekly_pct",      True)))
+        self._s_reset.state      = int(bool(self.config.get("show_reset_time",      False)))
+        self._s_sparkline.state  = int(bool(self.config.get("show_sparkline",       True)))
+        self._s_tooltip.state    = int(bool(self.config.get("show_hover_tooltip",   True)))
+        self._s_notif.state      = int(bool(self.config.get("notifications_enabled", True)))
+        self._s_peak_color.state = int(bool(self.config.get("peak_off_peak_color",  False)))
 
     # ── Display size ──
 
@@ -1894,6 +1939,26 @@ class ClaudeMonitorApp(rumps.App):
     def _set_tooltip(self, text):
         try:
             self._status_item.setToolTip_(text)
+        except Exception:
+            pass
+
+    def _apply_peak_color(self):
+        """Colour the menu bar title green (off-peak) or red (peak) when enabled.
+
+        Uses NSAttributedString on the underlying NSStatusBarButton so the colour
+        is independent of the text content built by _build_title().  When the
+        feature is disabled, rumps has already set a plain (uncoloured) title via
+        setTitle_(), so this method simply returns early.
+        """
+        if not self.config.get("peak_off_peak_color", False):
+            return
+        try:
+            from AppKit import NSAttributedString, NSForegroundColorAttributeName, NSColor
+            color = NSColor.systemRedColor() if is_peak_hours() else NSColor.systemGreenColor()
+            attrs = {NSForegroundColorAttributeName: color}
+            title = self.title or ""
+            attributed = NSAttributedString.alloc().initWithString_attributes_(title, attrs)
+            self._status_item.button().setAttributedTitle_(attributed)
         except Exception:
             pass
 
@@ -2220,6 +2285,7 @@ class ClaudeMonitorApp(rumps.App):
         recent_pcts = getattr(self, "_recent_session_pcts", None)
 
         self.title = _build_title(usage, self.config, velocity, recent_pcts)
+        self._apply_peak_color()
 
         if self.config.get("show_hover_tooltip", True):
             self._set_tooltip(_build_tooltip(usage, velocity, runway, msg_est))

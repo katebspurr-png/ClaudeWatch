@@ -1157,6 +1157,14 @@ def generate_dashboard(usage, stats, conversations=None):
     tip      = _tip(usage, stats)
     now_str  = datetime.now().strftime("%b %d, %Y  %I:%M %p")
 
+    # Colour for session bar
+    if spct >= 85:
+        s_color = "#ef4444"
+    elif spct >= 60:
+        s_color = "#f59e0b"
+    else:
+        s_color = "#0D9488"
+
     # Colour for weekly bar
     if wpct >= 85:
         w_color = "#ef4444"
@@ -1405,8 +1413,8 @@ def generate_dashboard(usage, stats, conversations=None):
 <div class="grid">
   <div class="card">
     <h2>Session Usage (5h)</h2>
-    <div class="big">{spct:.0f}%</div>
-    <div class="bar-wrap"><div class="bar" style="width:{min(spct,100):.1f}%;background:#0D9488"></div></div>
+    <div class="big" style="color:{s_color}">{spct:.0f}%</div>
+    <div class="bar-wrap"><div class="bar" style="width:{min(spct,100):.1f}%;background:{s_color}"></div></div>
     <div class="bar-labels"><span>used</span><span>100%</span></div>
     <div class="reset-badge">{f"resets in {sreset}" if sreset else ""}</div>
   </div>

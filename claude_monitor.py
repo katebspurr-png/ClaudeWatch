@@ -10,6 +10,7 @@ import webbrowser
 import json
 import threading
 import hashlib
+from Foundation import NSOperationQueue
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -1927,7 +1928,9 @@ class ClaudeMonitorApp(rumps.App):
         except Exception as e:
             rumps.notification("ClaudeWatch", "Error loading conversations", str(e)[:100])
         finally:
-            sender.title = "Recent Conversations"
+            NSOperationQueue.mainQueue().addOperationWithBlock_(
+                lambda: setattr(sender, 'title', "Recent Conversations")
+            )
 
     @rumps.clicked("Refresh Now")
     def manual_refresh(self, _):
@@ -2148,10 +2151,15 @@ class ClaudeMonitorApp(rumps.App):
                 self._conversations = self._fetch_conversations_data()
             except Exception:
                 self._conversations = None
-            self._apply_ui(usage)
-            self._check_limits(usage)
+            def _update(u=usage):
+                self._apply_ui(u)
+                self._check_limits(u)
+            NSOperationQueue.mainQueue().addOperationWithBlock_(_update)
         except Exception as e:
-            self._apply_ui(None, error=str(e))
+            error_msg = str(e)
+            NSOperationQueue.mainQueue().addOperationWithBlock_(
+                lambda: self._apply_ui(None, error=error_msg)
+            )
 
     def _check_limits(self, usage):
         if not self.config.get("notifications_enabled", True):

@@ -1,4 +1,4 @@
-# ClaudeWatch — Mac Menu Bar Usage Monitor
+# ClaudeMonitor — Mac Menu Bar Usage Monitor
 
 A lightweight Mac menu bar app that shows your Claude.ai usage percentages in real time, using the Claude desktop app's session cookies for authentication.
 
@@ -27,9 +27,9 @@ Click the icon to see reset times, extra credit usage, and a link to the full us
 
 ## Installing the DMG
 
-> **Gatekeeper warning:** ClaudeWatch is not signed with an Apple Developer certificate, so macOS will block it on first launch.
+> **Gatekeeper warning:** ClaudeMonitor is not signed with an Apple Developer certificate, so macOS will block it on first launch.
 >
-> To open it: **right-click** (or Control-click) `ClaudeWatch.app` → **Open** → **Open** again in the dialog. You only need to do this once.
+> To open it: **right-click** (or Control-click) `ClaudeMonitor.app` → **Open** → **Open** again in the dialog. You only need to do this once.
 
 ---
 
@@ -85,10 +85,10 @@ Response:
 
 ```bash
 # Stop
-launchctl unload ~/Library/LaunchAgents/com.katespurr.claudewatch.plist
+launchctl unload ~/Library/LaunchAgents/com.katespurr.claudemonitor.plist
 
 # Start
-launchctl load ~/Library/LaunchAgents/com.katespurr.claudewatch.plist
+launchctl load ~/Library/LaunchAgents/com.katespurr.claudemonitor.plist
 
 # Logs
 tail -f ~/.claude_monitor/stderr.log

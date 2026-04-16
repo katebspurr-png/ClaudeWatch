@@ -886,11 +886,13 @@ def _conversation_insights_html(conversations):
         return ""
 
     # Estimate relative cost from model and recency (more recent = more active = higher cost)
+    import re as _re
     ranked = []
     now = datetime.now(timezone.utc)
     for c in conversations[:20]:
         model_id, model_label = _get_conversation_model(c)
-        weight = MODEL_COST_WEIGHT.get(model_id, 1.0)
+        base_model_id = _re.sub(r"-\d{8}$", "", model_id)
+        weight = MODEL_COST_WEIGHT.get(model_id, MODEL_COST_WEIGHT.get(base_model_id, 1.0))
         name = c.get("name") or "Untitled"
         uuid = c.get("uuid", "")
         updated = c.get("updated_at", "")
@@ -1334,7 +1336,7 @@ def generate_dashboard(usage, stats, conversations=None):
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ClaudeWatch Dashboard</title>
+<title>ClaudeMonitor Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 <style>
   *{{box-sizing:border-box;margin:0;padding:0}}
@@ -1396,7 +1398,7 @@ def generate_dashboard(usage, stats, conversations=None):
     <circle cx="50" cy="50" r="48" fill="#0D9488"/>
     <text x="50" y="67" text-anchor="middle" font-size="52" fill="white" font-family="-apple-system">◈</text>
   </svg>
-  ClaudeWatch
+  ClaudeMonitor
 </h1>
 <p class="sub">Updated {now_str}</p>
 
@@ -1447,7 +1449,7 @@ def generate_dashboard(usage, stats, conversations=None):
 {conversations_html}
 {_model_guide_html(usage, stats)}
 
-<div class="footer">ClaudeWatch · data from Claude desktop app · <a href="{CLAUDE_USAGE_URL}" style="color:var(--accent)">open claude.ai</a></div>
+<div class="footer">ClaudeMonitor · data from Claude desktop app · <a href="{CLAUDE_USAGE_URL}" style="color:var(--accent)">open claude.ai</a></div>
 </body>
 </html>"""
 
@@ -1535,7 +1537,7 @@ def _build_conversations_html(conversations):
         </tr>\n"""
 
     return f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>ClaudeWatch — Recent Conversations</title>
+<html><head><meta charset="utf-8"><title>ClaudeMonitor — Recent Conversations</title>
 <style>
 body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
        margin: 2rem; background: #1a1a2e; color: #e0e0e0; }}
@@ -1616,15 +1618,33 @@ def _build_title(usage, config, velocity=None, recent_session_pcts=None):
     return title
 
 
+def _apply_colored_title(app, title, session_pct, weekly_pct):
+    """Set the menu bar title with color using NSAttributedString."""
+    try:
+        import AppKit
+        pct = max(session_pct or 0, weekly_pct or 0)
+        if pct >= 80:
+            color = AppKit.NSColor.systemRedColor()
+        elif pct >= 60:
+            color = AppKit.NSColor.systemOrangeColor()
+        else:
+            color = AppKit.NSColor.labelColor()
+        attrs = {AppKit.NSForegroundColorAttributeName: color}
+        attr_str = AppKit.NSAttributedString.alloc().initWithString_attributes_(title, attrs)
+        app._nsapp.nsstatusitem.setAttributedTitle_(attr_str)
+    except Exception:
+        pass  # plain title already set as fallback
+
+
 def _build_tooltip(usage, velocity=None, runway=None, msg_est=None):
     if usage is None:
-        return "ClaudeWatch — no data"
+        return "ClaudeMonitor — no data"
     spct = usage.get("session_pct", 0)
     wpct = usage.get("weekly_pct",  0)
     sr   = _fmt_reset(usage.get("session_resets_at", ""))
     wr   = _fmt_reset(usage.get("weekly_resets_at",  ""))
     lines = [
-        "ClaudeWatch",
+        "ClaudeMonitor",
         f"Session (5h):  {spct:.0f}%" + (f"  —  resets in {sr}" if sr else ""),
         f"Weekly  (7d):  {wpct:.0f}%" + (f"  —  resets in {wr}" if wr else ""),
     ]
@@ -1798,7 +1818,7 @@ class ClaudeMonitorApp(rumps.App):
 
         # First-run: offer login item when running as bundled .app
         if getattr(_sys, 'frozen', False):
-            _plist = Path.home() / "Library/LaunchAgents/com.katespurr.claudewatch.plist"
+            _plist = Path.home() / "Library/LaunchAgents/com.katespurr.claudemonitor.plist"
             if not _plist.exists():
                 self._first_run_timer = rumps.Timer(self._prompt_login_item, 1.5)
                 self._first_run_timer.start()
@@ -1806,14 +1826,14 @@ class ClaudeMonitorApp(rumps.App):
     def _prompt_login_item(self, timer):
         timer.stop()
         response = rumps.alert(
-            title="Welcome to ClaudeWatch",
-            message="Start ClaudeWatch automatically when you log in?",
+            title="Welcome to ClaudeMonitor",
+            message="Start ClaudeMonitor automatically when you log in?",
             ok="Yes, start at login",
             cancel="Not now",
         )
         if response == 1:
-            executable = Path(_sys.executable).parent / "ClaudeWatch"
-            plist_file = Path.home() / "Library/LaunchAgents/com.katespurr.claudewatch.plist"
+            executable = Path(_sys.executable).parent / "ClaudeMonitor"
+            plist_file = Path.home() / "Library/LaunchAgents/com.katespurr.claudemonitor.plist"
             plist_file.parent.mkdir(parents=True, exist_ok=True)
             plist_file.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -1821,7 +1841,7 @@ class ClaudeMonitorApp(rumps.App):
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.katespurr.claudewatch</string>
+    <string>com.katespurr.claudemonitor</string>
     <key>ProgramArguments</key>
     <array>
         <string>{executable}</string>
@@ -1837,8 +1857,8 @@ class ClaudeMonitorApp(rumps.App):
 </dict>
 </plist>""")
             subprocess.run(["launchctl", "load", str(plist_file)], check=False)
-            rumps.notification("ClaudeWatch", "Login item installed",
-                               "ClaudeWatch will start automatically at login.")
+            rumps.notification("ClaudeMonitor", "Login item installed",
+                               "ClaudeMonitor will start automatically at login.")
 
     # ── Settings ──
 
@@ -1909,7 +1929,7 @@ class ClaudeMonitorApp(rumps.App):
             path = generate_dashboard(self._usage, self._stats, getattr(self, "_conversations", None))
             webbrowser.open(f"file://{path}")
         else:
-            rumps.notification("ClaudeWatch", "No data yet", "Fetching usage now…")
+            rumps.notification("ClaudeMonitor", "No data yet", "Fetching usage now…")
             threading.Thread(target=self._refresh, daemon=True).start()
 
     @rumps.clicked("Recent Conversations")
@@ -1925,7 +1945,7 @@ class ClaudeMonitorApp(rumps.App):
             path.write_text(html)
             webbrowser.open(f"file://{path}")
         except Exception as e:
-            rumps.notification("ClaudeWatch", "Error loading conversations", str(e)[:100])
+            rumps.notification("ClaudeMonitor", "Error loading conversations", str(e)[:100])
         finally:
             sender.title = "Recent Conversations"
 
@@ -1938,7 +1958,7 @@ class ClaudeMonitorApp(rumps.App):
         rumps.quit_application()
 
     def restart_app(self, _):
-        rumps.notification("ClaudeWatch", "Restarting…", "")
+        rumps.notification("ClaudeMonitor", "Restarting…", "")
         rumps.quit_application()
 
     # ── Refresh interval ──
@@ -2169,7 +2189,7 @@ class ClaudeMonitorApp(rumps.App):
             # Notify on new session (but not on first launch)
             if old_reset is not None and sreset:
                 rumps.notification(
-                    "ClaudeWatch",
+                    "ClaudeMonitor",
                     "New session started",
                     "Fresh 5-hour window — slate is clean.",
                 )
@@ -2181,14 +2201,14 @@ class ClaudeMonitorApp(rumps.App):
             key = f"session_{t}"
             if spct >= t and key not in self._notified:
                 self._notified.add(key)
-                rumps.notification("ClaudeWatch", f"Session usage at {t}%",
+                rumps.notification("ClaudeMonitor", f"Session usage at {t}%",
                                    f"Resets in {sr}." if sr else "")
 
         for t in WEEKLY_THRESHOLDS:
             key = f"weekly_{t}"
             if wpct >= t and key not in self._notified:
                 self._notified.add(key)
-                rumps.notification("ClaudeWatch", f"Weekly usage at {t}%",
+                rumps.notification("ClaudeMonitor", f"Weekly usage at {t}%",
                                    f"Resets in {wr}." if wr else "")
 
         extra_pct = usage.get("extra_pct")
@@ -2198,7 +2218,7 @@ class ClaudeMonitorApp(rumps.App):
                 key = f"extra_{t}"
                 if extra_pct >= t and key not in self._notified:
                     self._notified.add(key)
-                    rumps.notification("ClaudeWatch", f"Extra credits at {t}%",
+                    rumps.notification("ClaudeMonitor", f"Extra credits at {t}%",
                                        f"{eu:.0f} credits used")
 
     def _apply_ui(self, usage, error=None):
@@ -2210,7 +2230,7 @@ class ClaudeMonitorApp(rumps.App):
         if error:
             self.title = "!"
             self.menu[session_detail].title = f"   {error[:60]}"
-            self._set_tooltip(f"ClaudeWatch — error\n{error[:120]}")
+            self._set_tooltip(f"ClaudeMonitor — error\n{error[:120]}")
             return
 
         velocity = getattr(self, "_velocity", None)
@@ -2220,6 +2240,7 @@ class ClaudeMonitorApp(rumps.App):
         recent_pcts = getattr(self, "_recent_session_pcts", None)
 
         self.title = _build_title(usage, self.config, velocity, recent_pcts)
+        _apply_colored_title(self, self.title, usage.get("session_pct", 0), usage.get("weekly_pct", 0))
 
         if self.config.get("show_hover_tooltip", True):
             self._set_tooltip(_build_tooltip(usage, velocity, runway, msg_est))

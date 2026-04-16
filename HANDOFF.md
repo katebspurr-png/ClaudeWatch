@@ -1,4 +1,4 @@
-# ClaudeWatch — Claude Code Handoff
+# ClaudeMonitor — Claude Code Handoff
 
 ## What this is
 A macOS menu bar app that shows Claude.ai usage percentages in real time, reading directly from the Claude desktop app's encrypted session cookies. No manual cookie setup required — this is the key differentiator vs. competitors.
@@ -88,7 +88,7 @@ Note: `seven_day_opus`, `seven_day_sonnet` etc. are null when not used but will 
   "is_temporary": false,
   "platform": "CLAUDE_AI",
   "project_uuid": "...",
-  "project": { "uuid": "...", "name": "ClaudeWatch" },
+  "project": { "uuid": "...", "name": "ClaudeMonitor" },
   "settings": { "enabled_web_search": true, "enabled_mcp_tools": {...}, ... }
 }
 ```
@@ -164,12 +164,12 @@ Trigger macOS notifications at 25%, 50%, 75%, 90% thresholds for both 5h and 7d 
 
 | Product | Auth method | Token counts | Notifications | Price |
 |---------|-------------|--------------|---------------|-------|
-| **ClaudeWatch** | Auto (desktop app cookies) ✅ | TBD | Not yet | TBD |
+| **ClaudeMonitor** | Auto (desktop app cookies) ✅ | TBD | Not yet | TBD |
 | ClaudeUsageBar | Manual cookie paste | No | Yes (25/50/75/90%) | Free |
 | Usagebar | Claude Code keychain | No | Yes (50/75/90%) | PWYW |
 | ClaudeTuner | Unknown | Yes | Yes | Freemium |
 
-ClaudeWatch's moat: **zero setup**. Every competitor requires manual cookie copying. This is the headline feature for marketing.
+ClaudeMonitor's moat: **zero setup**. Every competitor requires manual cookie copying. This is the headline feature for marketing.
 
 ---
 

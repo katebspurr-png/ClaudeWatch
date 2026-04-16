@@ -39,26 +39,26 @@ jobs:
       - name: Create DMG
         run: |
           TMP_DIR=$(mktemp -d)
-          cp -r dist/ClaudeWatch.app "$TMP_DIR/"
+          cp -r dist/ClaudeMonitor.app "$TMP_DIR/"
           ln -s /Applications "$TMP_DIR/Applications"
           hdiutil create \
-            -volname "ClaudeWatch" \
+            -volname "ClaudeMonitor" \
             -srcfolder "$TMP_DIR" \
             -ov -format UDZO \
-            "ClaudeWatch-${{ env.VERSION }}.dmg"
+            "ClaudeMonitor-${{ env.VERSION }}.dmg"
           rm -rf "$TMP_DIR"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ClaudeWatch-${{ env.VERSION }}.dmg
+          files: ClaudeMonitor-${{ env.VERSION }}.dmg
           generate_release_notes: true
           body: |
             ## Install
 
-            1. Download **ClaudeWatch-${{ env.VERSION }}.dmg**
-            2. Open the DMG and drag **ClaudeWatch** to your Applications folder
+            1. Download **ClaudeMonitor-${{ env.VERSION }}.dmg**
+            2. Open the DMG and drag **ClaudeMonitor** to your Applications folder
             3. Right-click → **Open** on first launch (required — app is unsigned)
-            4. ClaudeWatch will ask if you'd like it to start automatically at login
+            4. ClaudeMonitor will ask if you'd like it to start automatically at login
 
             **Requirements:** macOS · Claude desktop app installed and signed in

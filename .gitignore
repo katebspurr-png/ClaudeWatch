@@ -12,5 +12,8 @@ venv/
 # macOS
 .DS_Store
 
+# Brainstorming session files
+.superpowers/
+
 # Logs
 *.log

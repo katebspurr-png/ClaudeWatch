@@ -1,11 +1,11 @@
 """
-py2app build script for ClaudeWatch.
+py2app build script for ClaudeMonitor.
 
 Usage:
     pip install py2app
     python setup.py py2app
 
-Output: dist/ClaudeWatch.app
+Output: dist/ClaudeMonitor.app
 """
 
 from setuptools import setup
@@ -21,9 +21,9 @@ OPTIONS = {
     "argv_emulation": False,
     "iconfile": "ClaudeWatch.icns",
     "plist": {
-        "CFBundleName": "ClaudeWatch",
-        "CFBundleDisplayName": "ClaudeWatch",
-        "CFBundleIdentifier": "com.katespurr.claudewatch",
+        "CFBundleName": "ClaudeMonitor",
+        "CFBundleDisplayName": "ClaudeMonitor",
+        "CFBundleIdentifier": "com.katespurr.claudemonitor",
         "CFBundleVersion": "1.0.0",
         "CFBundleShortVersionString": "1.0.0",
         "LSUIElement": True,          # menu bar only — no Dock icon
@@ -34,7 +34,7 @@ OPTIONS = {
 }
 
 setup(
-    name="ClaudeWatch",
+    name="ClaudeMonitor",
     app=APP,
     data_files=DATA_FILES,
     options={"py2app": OPTIONS},

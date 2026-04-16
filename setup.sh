@@ -1,6 +1,6 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────────────────
-# ClaudeWatch — Installer / Updater / Uninstaller
+# ClaudeMonitor — Installer / Updater / Uninstaller
 #
 # Usage:
 #   ./setup.sh             Install or update
@@ -13,7 +13,7 @@ set -euo pipefail
 
 APP_DIR="$HOME/.claude_monitor"
 VENV_DIR="$APP_DIR/venv"
-PLIST_LABEL="com.katespurr.claudewatch"
+PLIST_LABEL="com.katespurr.claudemonitor"
 PLIST_FILE="$HOME/Library/LaunchAgents/$PLIST_LABEL.plist"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -29,13 +29,13 @@ ask()    { printf '\033[1m?\033[0m  %s ' "$*"; }
 
 if [ "${1:-}" = "--uninstall" ]; then
     echo ""
-    bold "ClaudeWatch — Uninstall"
+    bold "ClaudeMonitor — Uninstall"
     echo "─────────────────────────────────────"
     echo ""
 
     if launchctl list "$PLIST_LABEL" &>/dev/null 2>&1; then
         launchctl unload "$PLIST_FILE" 2>/dev/null || true
-        ok "Stopped ClaudeWatch"
+        ok "Stopped ClaudeMonitor"
     fi
 
     if [ -f "$PLIST_FILE" ]; then
@@ -63,7 +63,7 @@ fi
 # ── Header ────────────────────────────────────────────────────────────────────
 
 echo ""
-bold "◈  ClaudeWatch — Setup"
+bold "◈  ClaudeMonitor — Setup"
 echo "─────────────────────────────────────"
 echo ""
 
@@ -71,7 +71,7 @@ echo ""
 
 # macOS only
 if [ "$(uname)" != "Darwin" ]; then
-    fail "ClaudeWatch requires macOS."
+    fail "ClaudeMonitor requires macOS."
 fi
 
 # Python 3.9+
@@ -89,7 +89,7 @@ ok "Python $PY_VER"
 # Claude desktop app
 if [ ! -d "/Applications/Claude.app" ]; then
     warn "Claude desktop app not found at /Applications/Claude.app"
-    echo "     ClaudeWatch reads your session data from the Claude desktop app."
+    echo "     ClaudeMonitor reads your session data from the Claude desktop app."
     echo "     Download it from https://claude.ai/download then re-run this installer."
     echo ""
     ask "Continue anyway? (y/n):"
@@ -152,7 +152,7 @@ PYTHON_BIN="$VENV_DIR/bin/python3"
 # ── LaunchAgent ───────────────────────────────────────────────────────────────
 
 echo ""
-ask "Start ClaudeWatch automatically at login? (y/n):"
+ask "Start ClaudeMonitor automatically at login? (y/n):"
 read -r AUTO_START
 
 if [ "$AUTO_START" = "y" ] || [ "$AUTO_START" = "Y" ]; then
@@ -187,7 +187,7 @@ fi
 # ── Start now ─────────────────────────────────────────────────────────────────
 
 echo ""
-ask "Start ClaudeWatch now? (y/n):"
+ask "Start ClaudeMonitor now? (y/n):"
 read -r START_NOW
 
 if [ "$START_NOW" = "y" ] || [ "$START_NOW" = "Y" ]; then
@@ -201,7 +201,7 @@ if [ "$START_NOW" = "y" ] || [ "$START_NOW" = "Y" ]; then
     # Give it a moment, then verify
     sleep 2
     if launchctl list "$PLIST_LABEL" &>/dev/null 2>&1 || pgrep -f "claude_monitor.py" &>/dev/null; then
-        ok "ClaudeWatch is running — look for the icon in your menu bar"
+        ok "ClaudeMonitor is running — look for the icon in your menu bar"
         echo "     (If the icon is hidden, hold ⌘ and drag other menu bar icons to make space)"
     else
         warn "App may not have started. Check logs: $APP_DIR/stderr.log"
@@ -214,7 +214,7 @@ echo ""
 echo "─────────────────────────────────────"
 bold "◈  Setup complete!"
 echo ""
-echo "Manage ClaudeWatch:"
+echo "Manage ClaudeMonitor:"
 echo "  Start:     launchctl load $PLIST_FILE"
 echo "  Stop:      launchctl unload $PLIST_FILE"
 echo "  Logs:      $APP_DIR/stderr.log"

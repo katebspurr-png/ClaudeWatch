@@ -1,8 +1,8 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────────────────
-# ClaudeWatch — Build Script
+# ClaudeMonitor — Build Script
 #
-# Builds ClaudeWatch.app via py2app and packages it as a DMG.
+# Builds ClaudeMonitor.app via py2app and packages it as a DMG.
 #
 # Usage:
 #   ./build_dmg.sh              Build app + DMG
@@ -13,7 +13,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_VENV="$SCRIPT_DIR/.build_venv"
-APP_NAME="ClaudeWatch"
+APP_NAME="ClaudeMonitor"
 DMG_NAME="$APP_NAME.dmg"
 APP_ONLY=false
 
@@ -29,7 +29,7 @@ bold() { printf '\033[1m%s\033[0m\n' "$*"; }
 # ── Pre-flight ────────────────────────────────────────────────────────────────
 
 echo ""
-bold "◈  ClaudeWatch — Build"
+bold "◈  ClaudeMonitor — Build"
 echo "─────────────────────────────────────"
 echo ""
 

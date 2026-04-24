@@ -52,6 +52,7 @@ DEFAULT_CONFIG = {
     "refresh_interval_minutes": 5,
     "show_session_pct":   True,
     "show_weekly_pct":    True,
+    "show_design_pct":    False,
     "show_reset_time":    False,
     "show_hover_tooltip": True,
     "notifications_enabled": True,
@@ -218,9 +219,10 @@ def fetch_claude_usage():
     resp.raise_for_status()
     data = _decode_response(resp)
 
-    five_hour = data.get("five_hour")  or {}
-    seven_day = data.get("seven_day")  or {}
-    extra     = data.get("extra_usage") or {}
+    five_hour  = data.get("five_hour")   or {}
+    seven_day  = data.get("seven_day")   or {}
+    extra      = data.get("extra_usage") or {}
+    omelette   = data.get("seven_day_omelette") or {}  # Claude Design
 
     # Per-model breakdowns (non-null only for Max plan users)
     per_model = {}
@@ -234,15 +236,17 @@ def fetch_claude_usage():
             }
 
     return {
-        "session_pct":       five_hour.get("utilization", 0.0),
-        "weekly_pct":        seven_day.get("utilization",  0.0),
-        "session_resets_at": five_hour.get("resets_at", ""),
-        "weekly_resets_at":  seven_day.get("resets_at",  ""),
-        "extra_used":        extra.get("used_credits"),
-        "extra_limit":       extra.get("monthly_limit"),
-        "extra_enabled":     extra.get("is_enabled", False),
-        "extra_pct":         extra.get("utilization"),
-        "per_model":         per_model,
+        "session_pct":        five_hour.get("utilization", 0.0),
+        "weekly_pct":         seven_day.get("utilization",  0.0),
+        "session_resets_at":  five_hour.get("resets_at", ""),
+        "weekly_resets_at":   seven_day.get("resets_at",  ""),
+        "design_pct":         omelette.get("utilization") if omelette else None,
+        "design_resets_at":   omelette.get("resets_at", ""),
+        "extra_used":         extra.get("used_credits"),
+        "extra_limit":        extra.get("monthly_limit"),
+        "extra_enabled":      extra.get("is_enabled", False),
+        "extra_pct":          extra.get("utilization"),
+        "per_model":          per_model,
         "sonnet_pct": data["seven_day_sonnet"]["utilization"] if data.get("seven_day_sonnet") else None,
         "opus_pct":   data["seven_day_opus"]["utilization"]   if data.get("seven_day_opus")   else None,
     }
@@ -1600,6 +1604,8 @@ def _build_title(usage, config, velocity=None, recent_session_pcts=None):
                 d = velocity["weekly_delta"]
                 w_str += f"+{d:.0f}" if d > 0 else f"{d:.0f}"
         parts.append(w_str)
+    if config.get("show_design_pct") and usage.get("design_pct") is not None:
+        parts.append(f"D:{usage['design_pct']:.0f}%")
     title = " | ".join(parts) if parts else "◈"
     if full_detail:
         if config.get("show_reset_time"):
@@ -1704,6 +1710,7 @@ class ClaudeMonitorApp(rumps.App):
         # Settings checkmark items
         self._s_session   = rumps.MenuItem("Session % (5h)", callback=self._toggle("show_session_pct"))
         self._s_weekly    = rumps.MenuItem("Weekly % (7d)",  callback=self._toggle("show_weekly_pct"))
+        self._s_design    = rumps.MenuItem("Design % (7d)",  callback=self._toggle("show_design_pct"))
         self._s_reset     = rumps.MenuItem("Reset time",     callback=self._toggle("show_reset_time"))
         self._s_sparkline = rumps.MenuItem("Sparkline",      callback=self._toggle("show_sparkline"))
         self._s_tooltip   = rumps.MenuItem("Hover tooltip",  callback=self._toggle("show_hover_tooltip"))
@@ -1726,6 +1733,7 @@ class ClaudeMonitorApp(rumps.App):
             rumps.MenuItem("Show in menu bar:", callback=None),
             self._s_session,
             self._s_weekly,
+            self._s_design,
             self._s_reset,
             self._s_sparkline,
             None,
@@ -1791,6 +1799,8 @@ class ClaudeMonitorApp(rumps.App):
             rumps.MenuItem("   —  ",             callback=None),
             rumps.MenuItem("   weekly_runway",   callback=None),
             rumps.MenuItem("   per_model_line",  callback=None),
+            rumps.MenuItem("⬤  Design (7d)",    callback=None),
+            rumps.MenuItem("   design_detail",   callback=None),
             rumps.MenuItem("   extra_credits",   callback=None),
             None,
             rumps.MenuItem("   velocity_line",   callback=None),
@@ -1809,6 +1819,7 @@ class ClaudeMonitorApp(rumps.App):
         # Hide dynamic items initially
         for key in ("   per_model_line", "   extra_credits",
                     "   session_runway", "   weekly_runway",
+                    "⬤  Design (7d)", "   design_detail",
                     "   velocity_line", "   msgs_remaining", "   suggestion_line"):
             self.menu[key].hidden = True
 
@@ -1880,6 +1891,7 @@ class ClaudeMonitorApp(rumps.App):
     def _sync_checkmarks(self):
         self._s_session.state   = int(bool(self.config.get("show_session_pct",   True)))
         self._s_weekly.state    = int(bool(self.config.get("show_weekly_pct",    True)))
+        self._s_design.state    = int(bool(self.config.get("show_design_pct",    False)))
         self._s_reset.state     = int(bool(self.config.get("show_reset_time",    False)))
         self._s_sparkline.state = int(bool(self.config.get("show_sparkline",     True)))
         self._s_tooltip.state   = int(bool(self.config.get("show_hover_tooltip", True)))
@@ -2290,6 +2302,18 @@ class ClaudeMonitorApp(rumps.App):
             self.menu["   per_model_line"].hidden = False
         else:
             self.menu["   per_model_line"].hidden = True
+
+        # Claude Design usage
+        design_pct = usage.get("design_pct")
+        if design_pct is not None:
+            dreset = _fmt_reset(usage.get("design_resets_at", ""))
+            self.menu["⬤  Design (7d)"].title  = f"⬤  Design (7d) — {design_pct:.1f}%"
+            self.menu["   design_detail"].title = f"   resets in {dreset}" if dreset else "   —"
+            self.menu["⬤  Design (7d)"].hidden  = False
+            self.menu["   design_detail"].hidden = False
+        else:
+            self.menu["⬤  Design (7d)"].hidden  = True
+            self.menu["   design_detail"].hidden = True
 
         # Extra credits
         eu = usage.get("extra_used")

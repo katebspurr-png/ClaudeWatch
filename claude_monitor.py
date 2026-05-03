@@ -130,7 +130,7 @@ def _get_aes_key():
     result = subprocess.run(
         ["security", "find-generic-password",
          "-s", "Claude Safe Storage", "-a", "Claude Key", "-w"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, timeout=10,
     )
     password = result.stdout.strip()
     if not password:
@@ -236,8 +236,8 @@ def fetch_claude_usage():
             }
 
     return {
-        "session_pct":        five_hour.get("utilization", 0.0),
-        "weekly_pct":         seven_day.get("utilization",  0.0),
+        "session_pct":        five_hour.get("utilization") or 0.0,
+        "weekly_pct":         seven_day.get("utilization")  or 0.0,
         "session_resets_at":  five_hour.get("resets_at", ""),
         "weekly_resets_at":   seven_day.get("resets_at",  ""),
         "design_pct":         omelette.get("utilization") if omelette else None,
@@ -1824,6 +1824,10 @@ class ClaudeMonitorApp(rumps.App):
             self.menu[key].hidden = True
 
         if DEPS_OK:
+            import queue as _queue
+            self._ui_queue = _queue.Queue()
+            self._ui_poll_timer = rumps.Timer(self._drain_ui_queue, 0.1)
+            self._ui_poll_timer.start()
             self._start_timer()
             threading.Thread(target=self._refresh, daemon=True).start()
 
@@ -1997,6 +2001,22 @@ class ClaudeMonitorApp(rumps.App):
 
     def _on_timer(self, _):
         threading.Thread(target=self._refresh, daemon=True).start()
+
+    def _dispatch_ui(self, usage, error=None):
+        """Queue a UI update to be applied on the main thread."""
+        self._ui_queue.put((usage, error))
+
+    def _drain_ui_queue(self, _):
+        """Called by a main-thread timer every 0.1s — applies any pending UI updates."""
+        import queue as _queue
+        try:
+            while True:
+                usage, error = self._ui_queue.get_nowait()
+                self._apply_ui(usage, error)
+                if usage and not error:
+                    self._check_limits(usage)
+        except _queue.Empty:
+            pass
 
     def _start_timer(self):
         self._restart_timer()
@@ -2180,10 +2200,9 @@ class ClaudeMonitorApp(rumps.App):
                 self._conversations = self._fetch_conversations_data()
             except Exception:
                 self._conversations = None
-            self._apply_ui(usage)
-            self._check_limits(usage)
+            self._dispatch_ui(usage)
         except Exception as e:
-            self._apply_ui(None, error=str(e))
+            self._dispatch_ui(None, error=str(e))
 
     def _check_limits(self, usage):
         if not self.config.get("notifications_enabled", True):

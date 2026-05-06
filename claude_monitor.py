@@ -63,9 +63,11 @@ DEFAULT_CONFIG = {
 DISPLAY_SIZE_OPTIONS = ["full", "compact", "minimal", "custom"]
 
 CREDITS_PER_DOLLAR = 100   # 1 credit = $0.01 (confirmed against billing)
-SESSION_THRESHOLDS = [75, 90]   # % session usage to notify at
-WEEKLY_THRESHOLDS  = [75, 90]   # % weekly usage to notify at
-EXTRA_THRESHOLDS   = [80, 95]   # % extra credits to notify at
+SESSION_THRESHOLDS = [75, 90]          # % session usage to notify at
+WEEKLY_THRESHOLDS  = [75, 90]          # % weekly usage to notify at
+EXTRA_THRESHOLDS   = [80, 95]          # % extra credits to notify at
+SESSION_RUNWAY_ALERTS = [30]           # minutes: alert when session limit this close
+WEEKLY_RUNWAY_ALERTS  = [120, 60, 30]  # minutes: alert when weekly limit this close
 
 REFRESH_OPTIONS = [1, 5, 15, 30]  # minutes
 
@@ -1209,7 +1211,7 @@ def generate_dashboard(usage, stats, conversations=None):
     else:
         w_color = "#0D9488"
 
-    # Projection line
+    # Projection line (weekly limit ETA)
     if stats and stats["projected_full"]:
         pf = stats["projected_full"]
         days_away = (pf - datetime.now(timezone.utc)).total_seconds() / 86400
@@ -1221,6 +1223,28 @@ def generate_dashboard(usage, stats, conversations=None):
     else:
         proj_str   = "Not enough data for projection yet"
         proj_color = "#6b7280"
+
+    # At-reset projections
+    s_proj = projections.get("projected_session_pct") if projections else None
+    w_proj = projections.get("projected_weekly_pct")  if projections else None
+    s_proj_html = f'<div class="proj">→ <b>{s_proj:.0f}%</b> projected at reset</div>' if s_proj is not None else ""
+    w_proj_html = f'<div class="proj">→ <b>{w_proj:.0f}%</b> projected at reset</div>' if w_proj is not None else ""
+
+    # Design card
+    design_pct   = usage.get("design_pct")
+    design_reset = _fmt_reset(usage.get("design_resets_at", ""))
+    if design_pct is not None:
+        d_color = "#ef4444" if design_pct >= 85 else "#f59e0b" if design_pct >= 60 else "#0D9488"
+        design_card_html = f"""
+  <div class="card">
+    <h2>Design Usage (7d)</h2>
+    <div class="big" style="color:{d_color}">{design_pct:.0f}%</div>
+    <div class="bar-wrap"><div class="bar" style="width:{min(design_pct,100):.1f}%;background:{d_color}"></div></div>
+    <div class="bar-labels"><span>used</span><span>100%</span></div>
+    <div class="reset-badge">{f"resets in {design_reset}" if design_reset else ""}</div>
+  </div>"""
+    else:
+        design_card_html = ""
 
     # Chart data
     if stats and len(stats["chart_labels"]) > 1:
@@ -1352,6 +1376,7 @@ def generate_dashboard(usage, stats, conversations=None):
     history_rows = load_history()
     velocity = calc_velocity(history_rows)
     runway = calc_runway(usage, velocity)
+    projections = calc_projections(usage, velocity)
     msg_est = estimate_messages_remaining(usage, history_rows)
     power_user_html = _power_user_dashboard_html(usage, stats, velocity, runway, msg_est)
 
@@ -1453,6 +1478,7 @@ def generate_dashboard(usage, stats, conversations=None):
     <div class="bar-wrap"><div class="bar" style="width:{min(spct,100):.1f}%;background:#0D9488"></div></div>
     <div class="bar-labels"><span>used</span><span>100%</span></div>
     <div class="reset-badge">{f"resets in {sreset}" if sreset else ""}</div>
+    {s_proj_html}
   </div>
   <div class="card">
     <h2>Weekly Usage (7d)</h2>
@@ -1461,7 +1487,9 @@ def generate_dashboard(usage, stats, conversations=None):
     <div class="bar-labels"><span>used</span><span>100%</span></div>
     <div class="reset-badge">{f"resets in {wreset}" if wreset else ""}</div>
     <div class="proj">{proj_str}</div>
+    {w_proj_html}
   </div>
+  {design_card_html}
 </div>
 
 <div class="stats">
@@ -2293,6 +2321,34 @@ class ClaudeMonitorApp(rumps.App):
                     self._notified.add(key)
                     rumps.notification("ClaudeMonitor", f"Extra credits at {t}%",
                                        f"{eu:.0f} credits used")
+
+        # Runway-based alerts — fire when limit is approaching at current pace
+        runway = getattr(self, "_runway", None)
+        if runway:
+            s_run = runway.get("session_runway_min")
+            if s_run is not None:
+                for mins in SESSION_RUNWAY_ALERTS:
+                    key = f"session_runway_{mins}_{sreset}"
+                    if s_run <= mins and key not in self._notified:
+                        self._notified.add(key)
+                        rumps.notification(
+                            "ClaudeMonitor",
+                            f"Session limit in ~{_fmt_runway(s_run)}",
+                            "At your current pace — consider switching to Haiku.",
+                        )
+
+            w_run = runway.get("weekly_runway_min")
+            if w_run is not None:
+                for mins in WEEKLY_RUNWAY_ALERTS:
+                    key = f"weekly_runway_{mins}"
+                    if w_run <= mins and key not in self._notified:
+                        self._notified.add(key)
+                        label = _fmt_runway(w_run)
+                        rumps.notification(
+                            "ClaudeMonitor",
+                            f"Weekly limit in ~{label}",
+                            "At your current pace.",
+                        )
 
     def _apply_ui(self, usage, error=None):
         session_header = "⬤  Session (5h)"

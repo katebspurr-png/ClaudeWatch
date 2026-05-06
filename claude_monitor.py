@@ -649,6 +649,44 @@ def calc_runway(usage, velocity):
     return result
 
 
+def calc_projections(usage, velocity):
+    """
+    Project session and weekly utilization at the next reset time,
+    based on current burn velocity.
+    Returns dict with projected_session_pct and projected_weekly_pct,
+    or None values if projection can't be made.
+    """
+    result = {"projected_session_pct": None, "projected_weekly_pct": None}
+    if not velocity:
+        return result
+
+    now = datetime.now(timezone.utc)
+
+    s_vel = velocity.get("session_velocity", 0)
+    if s_vel > 0.1:
+        reset_str = usage.get("session_resets_at", "")
+        try:
+            reset_dt = datetime.fromisoformat(reset_str.replace("Z", "+00:00"))
+            hours_left = max((reset_dt - now).total_seconds() / 3600, 0)
+            projected = usage["session_pct"] + s_vel * hours_left
+            result["projected_session_pct"] = min(projected, 100)
+        except Exception:
+            pass
+
+    w_vel = velocity.get("weekly_velocity", 0)
+    if w_vel > 0.1:
+        reset_str = usage.get("weekly_resets_at", "")
+        try:
+            reset_dt = datetime.fromisoformat(reset_str.replace("Z", "+00:00"))
+            hours_left = max((reset_dt - now).total_seconds() / 3600, 0)
+            projected = usage["weekly_pct"] + w_vel * hours_left
+            result["projected_weekly_pct"] = min(projected, 100)
+        except Exception:
+            pass
+
+    return result
+
+
 def estimate_messages_remaining(usage, rows):
     """
     Estimate how many messages remain based on average % cost per interaction.
@@ -1745,7 +1783,7 @@ class ClaudeMonitorApp(rumps.App):
 
         # Model guide submenu
         def _info(label):
-            return rumps.MenuItem(label, callback=None)
+            return rumps.MenuItem(label, callback=lambda _: None)
 
         haiku = rumps.MenuItem("Haiku — fast & cheap")
         haiku.update([
@@ -1792,20 +1830,22 @@ class ClaudeMonitorApp(rumps.App):
             rumps.MenuItem("View Dashboard",         callback=self.open_dashboard),
             rumps.MenuItem("Recent Conversations",   callback=self.open_conversations),
             None,
-            rumps.MenuItem("⬤  Session (5h)",   callback=None),
-            rumps.MenuItem("   —",               callback=None),
-            rumps.MenuItem("   session_runway",  callback=None),
-            rumps.MenuItem("⬤  Weekly (7d)",    callback=None),
-            rumps.MenuItem("   —  ",             callback=None),
-            rumps.MenuItem("   weekly_runway",   callback=None),
-            rumps.MenuItem("   per_model_line",  callback=None),
-            rumps.MenuItem("⬤  Design (7d)",    callback=None),
-            rumps.MenuItem("   design_detail",   callback=None),
-            rumps.MenuItem("   extra_credits",   callback=None),
+            rumps.MenuItem("⬤  Session (5h)",       callback=lambda _: None),
+            rumps.MenuItem("   —",                   callback=lambda _: None),
+            rumps.MenuItem("   session_runway",      callback=lambda _: None),
+            rumps.MenuItem("   session_projection",  callback=lambda _: None),
+            rumps.MenuItem("⬤  Weekly (7d)",        callback=lambda _: None),
+            rumps.MenuItem("   —  ",                 callback=lambda _: None),
+            rumps.MenuItem("   weekly_runway",       callback=lambda _: None),
+            rumps.MenuItem("   weekly_projection",   callback=lambda _: None),
+            rumps.MenuItem("   per_model_line",      callback=lambda _: None),
+            rumps.MenuItem("⬤  Design (7d)",    callback=lambda _: None),
+            rumps.MenuItem("   design_detail",   callback=lambda _: None),
+            rumps.MenuItem("   extra_credits",   callback=lambda _: None),
             None,
-            rumps.MenuItem("   velocity_line",   callback=None),
-            rumps.MenuItem("   msgs_remaining",  callback=None),
-            rumps.MenuItem("   suggestion_line", callback=None),
+            rumps.MenuItem("   velocity_line",   callback=lambda _: None),
+            rumps.MenuItem("   msgs_remaining",  callback=lambda _: None),
+            rumps.MenuItem("   suggestion_line", callback=lambda _: None),
             None,
             model_guide,
             settings,
@@ -1819,6 +1859,7 @@ class ClaudeMonitorApp(rumps.App):
         # Hide dynamic items initially
         for key in ("   per_model_line", "   extra_credits",
                     "   session_runway", "   weekly_runway",
+                    "   session_projection", "   weekly_projection",
                     "⬤  Design (7d)", "   design_detail",
                     "   velocity_line", "   msgs_remaining", "   suggestion_line"):
             self.menu[key].hidden = True
@@ -1929,7 +1970,7 @@ class ClaudeMonitorApp(rumps.App):
 
     def _set_tooltip(self, text):
         try:
-            self._status_item.setToolTip_(text)
+            self._nsapp.nsstatusitem.setToolTip_(text)
         except Exception:
             pass
 
@@ -2190,8 +2231,9 @@ class ClaudeMonitorApp(rumps.App):
             log_usage(usage)
             rows         = load_history()
             self._stats  = calculate_stats(usage, rows)
-            self._velocity = calc_velocity(rows)
-            self._runway   = calc_runway(usage, self._velocity)
+            self._velocity    = calc_velocity(rows)
+            self._runway      = calc_runway(usage, self._velocity)
+            self._projections = calc_projections(usage, self._velocity)
             self._msg_est  = estimate_messages_remaining(usage, rows)
             self._suggestion = smart_suggestion(usage, self._stats, self._velocity)
             # Recent session pcts for sparkline (last ~8 readings)
@@ -2264,10 +2306,11 @@ class ClaudeMonitorApp(rumps.App):
             self._set_tooltip(f"ClaudeMonitor — error\n{error[:120]}")
             return
 
-        velocity = getattr(self, "_velocity", None)
-        runway   = getattr(self, "_runway", None)
-        msg_est  = getattr(self, "_msg_est", None)
-        suggestion = getattr(self, "_suggestion", None)
+        velocity    = getattr(self, "_velocity", None)
+        runway      = getattr(self, "_runway", None)
+        projections = getattr(self, "_projections", None)
+        msg_est     = getattr(self, "_msg_est", None)
+        suggestion  = getattr(self, "_suggestion", None)
         recent_pcts = getattr(self, "_recent_session_pcts", None)
 
         self.title = _build_title(usage, self.config, velocity, recent_pcts)
@@ -2294,6 +2337,14 @@ class ClaudeMonitorApp(rumps.App):
         else:
             self.menu["   session_runway"].hidden = True
 
+        # Session projection
+        s_proj = projections.get("projected_session_pct") if projections else None
+        if s_proj is not None:
+            self.menu["   session_projection"].title = f"   → {s_proj:.0f}% projected at reset"
+            self.menu["   session_projection"].hidden = False
+        else:
+            self.menu["   session_projection"].hidden = True
+
         self.menu[weekly_header].title  = f"⬤  Weekly (7d) — {wpct:.1f}%"
 
         if wreset:
@@ -2308,6 +2359,14 @@ class ClaudeMonitorApp(rumps.App):
             self.menu["   weekly_runway"].hidden = False
         else:
             self.menu["   weekly_runway"].hidden = True
+
+        # Weekly projection
+        w_proj = projections.get("projected_weekly_pct") if projections else None
+        if w_proj is not None:
+            self.menu["   weekly_projection"].title = f"   → {w_proj:.0f}% projected at reset"
+            self.menu["   weekly_projection"].hidden = False
+        else:
+            self.menu["   weekly_projection"].hidden = True
 
         # Per-model breakdowns (combined sub-line in weekly section)
         per_model = usage.get("per_model", {})

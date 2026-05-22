@@ -1763,6 +1763,11 @@ class ClaudeMonitorApp(rumps.App):
             quit_button=None,
         )
 
+        import AppKit
+        AppKit.NSApplication.sharedApplication().setActivationPolicy_(
+            AppKit.NSApplicationActivationPolicyAccessory
+        )
+
         self.config          = load_config()
         self._usage          = None
         self._stats          = None
@@ -2496,6 +2501,4 @@ class ClaudeMonitorApp(rumps.App):
 # ─── Entry point ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    from AppKit import NSApp, NSApplicationActivationPolicyAccessory
-    NSApp.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
     ClaudeMonitorApp().run()

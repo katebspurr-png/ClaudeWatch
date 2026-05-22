@@ -2496,4 +2496,6 @@ class ClaudeMonitorApp(rumps.App):
 # ─── Entry point ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    from AppKit import NSApp, NSApplicationActivationPolicyAccessory
+    NSApp.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
     ClaudeMonitorApp().run()

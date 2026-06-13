@@ -5,6 +5,8 @@ Claude Monitor — Mac Menu Bar App
 Shows Claude.ai usage % in the menu bar and a local analytics dashboard.
 """
 
+__version__ = "1.0.7"
+
 import rumps
 import webbrowser
 import json

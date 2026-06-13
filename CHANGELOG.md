@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v1.0.7 — 2026-06-13
 
 ### Added
 - **Fable 5 model support** — `claude-fable-5` added to model display mapping and conversation cost ranking. Fable 5 appears in the Model Guide (menu bar and dashboard) under "Creative & narrative" for storytelling, character building, creative ideation, and brand copy.

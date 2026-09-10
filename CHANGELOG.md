@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.0.8 — 2026-09-10
+
+### Fixed
+- **"Reset clock time" now works on its own** — enabling the clock time without "Reset countdown" left the display size matched to the Compact preset, which hides all reset info in the menu bar. The preset matcher now includes the clock-time flag, so toggling it alone switches to Custom and the clock shows.
+
 ## v1.0.7 — 2026-06-13
 
 ### Added

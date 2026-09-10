@@ -5,7 +5,7 @@ Claude Monitor — Mac Menu Bar App
 Shows Claude.ai usage % in the menu bar and a local analytics dashboard.
 """
 
-__version__ = "1.0.7"
+__version__ = "1.0.8"
 
 import rumps
 import webbrowser
@@ -2083,7 +2083,7 @@ class ClaudeMonitorApp(rumps.App):
         def callback(_):
             self.config[key] = not self.config.get(key, True)
             # Auto-detect preset match, or fall back to "custom"
-            _preset_keys = ("show_session_pct", "show_weekly_pct", "show_reset_time", "show_sparkline")
+            _preset_keys = ("show_session_pct", "show_weekly_pct", "show_reset_time", "show_reset_clock", "show_sparkline")
             current = {k: bool(self.config.get(k)) for k in _preset_keys}
             matched = next((s for s, p in self._DISPLAY_SIZE_PRESETS.items() if p == current), "custom")
             self.config["display_size"] = matched
@@ -2107,9 +2107,9 @@ class ClaudeMonitorApp(rumps.App):
     # ── Display size ──
 
     _DISPLAY_SIZE_PRESETS = {
-        "full":    {"show_session_pct": True,  "show_weekly_pct": True,  "show_reset_time": True,  "show_sparkline": True},
-        "compact": {"show_session_pct": True,  "show_weekly_pct": True,  "show_reset_time": False, "show_sparkline": False},
-        "minimal": {"show_session_pct": False, "show_weekly_pct": False, "show_reset_time": False, "show_sparkline": False},
+        "full":    {"show_session_pct": True,  "show_weekly_pct": True,  "show_reset_time": True, "show_reset_clock": False,  "show_sparkline": True},
+        "compact": {"show_session_pct": True,  "show_weekly_pct": True,  "show_reset_time": False, "show_reset_clock": False, "show_sparkline": False},
+        "minimal": {"show_session_pct": False, "show_weekly_pct": False, "show_reset_time": False, "show_reset_clock": False, "show_sparkline": False},
     }
 
     def _set_display_size(self, size_key):

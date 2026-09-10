@@ -55,10 +55,12 @@ DEFAULT_CONFIG = {
     "show_session_pct":   True,
     "show_weekly_pct":    True,
     "show_reset_time":    False,
+    "show_reset_clock":   False,
     "show_hover_tooltip": True,
     "notifications_enabled": True,
     "display_size":       "full",       # "full", "compact", or "minimal"
     "show_sparkline":     True,
+    "show_fable_usage":   False,
 }
 
 DISPLAY_SIZE_OPTIONS = ["full", "compact", "minimal", "custom"]
@@ -73,6 +75,7 @@ WEEKLY_RUNWAY_ALERTS  = [120, 60, 30]  # minutes: alert when weekly limit this c
 REFRESH_OPTIONS = [1, 5, 15, 30]  # minutes
 
 MODEL_DISPLAY = {
+    "claude-sonnet-5":            "Sonnet 5",
     "claude-sonnet-4-6":          "Sonnet 4.6",
     "claude-opus-4-6":            "Opus 4.6",
     "claude-fable-5":             "Fable 5",
@@ -126,6 +129,60 @@ def _get_conversation_model(conv):
     if base in MODEL_DISPLAY:
         return model_id, MODEL_DISPLAY[base]
     return model_id, model_id.split("-")[-1].title()
+
+
+def _extract_conv_stats(detail):
+    """
+    Walk chat_messages in a conversation detail response and extract
+    usage-relevant stats. The API doesn't expose token counts, so we
+    estimate from character length (≈4 chars per token).
+    """
+    msgs = detail.get("chat_messages") or []
+    turns = 0
+    chars = 0
+    thinking_chars = 0
+    tool_calls = 0
+    for msg in msgs:
+        if msg.get("sender") == "assistant":
+            turns += 1
+        chars += len(msg.get("text") or "")
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type", "")
+            if btype == "thinking":
+                t = block.get("thinking") or ""
+                thinking_chars += len(t)
+                chars += len(t)
+            elif btype == "tool_use":
+                tool_calls += 1
+                chars += len(json.dumps(block.get("input", ""), default=str))
+            elif btype == "tool_result":
+                chars += len(json.dumps(block.get("content", ""), default=str))
+            elif btype == "text":
+                # msg["text"] already covers visible text; only count if text is absent
+                if not msg.get("text"):
+                    chars += len(block.get("text") or "")
+    return {
+        "turns": turns,
+        "est_tokens": chars // 4,
+        "thinking_tokens": thinking_chars // 4,
+        "tool_calls": tool_calls,
+    }
+
+
+def _fmt_tokens(n):
+    """Format a token count like 850, 12.4k, 1.2M."""
+    if n is None:
+        return "—"
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n/1_000:.1f}k"
+    return str(n)
 
 
 # ─── Cookie decryption ───────────────────────────────────────────────────────
@@ -229,7 +286,7 @@ def fetch_claude_usage():
 
     # Per-model breakdowns (non-null only for Max plan users)
     per_model = {}
-    for key in ("seven_day_opus", "seven_day_sonnet", "seven_day_cowork"):
+    for key in ("seven_day_opus", "seven_day_sonnet", "seven_day_cowork", "seven_day_fable"):
         val = data.get(key)
         if val and isinstance(val, dict) and val.get("utilization") is not None:
             label = key.replace("seven_day_", "").capitalize()
@@ -237,6 +294,21 @@ def fetch_claude_usage():
                 "utilization": val["utilization"],
                 "resets_at":   val.get("resets_at", ""),
             }
+
+    # Newer API shape: model-scoped weekly limits (Fable, etc.) arrive in the
+    # `limits` array as kind="weekly_scoped" — the seven_day_* keys are null.
+    for lim in data.get("limits") or []:
+        if not isinstance(lim, dict) or lim.get("kind") != "weekly_scoped":
+            continue
+        scope = lim.get("scope") or {}
+        label = (scope.get("model") or {}).get("display_name")
+        if not label or lim.get("percent") is None or label in per_model:
+            continue
+        per_model[label] = {
+            "utilization": float(lim["percent"]),
+            "resets_at":   lim.get("resets_at", ""),
+            "severity":    lim.get("severity", "normal"),
+        }
 
     return {
         "session_pct":        five_hour.get("utilization") or 0.0,
@@ -250,6 +322,7 @@ def fetch_claude_usage():
         "per_model":          per_model,
         "sonnet_pct": data["seven_day_sonnet"]["utilization"] if data.get("seven_day_sonnet") else None,
         "opus_pct":   data["seven_day_opus"]["utilization"]   if data.get("seven_day_opus")   else None,
+        "fable_pct":  per_model["Fable"]["utilization"] if per_model.get("Fable") else None,
     }
 
 
@@ -265,9 +338,14 @@ def init_db():
             session_resets_at TEXT,
             weekly_resets_at TEXT,
             extra_used       REAL,
-            extra_limit      REAL
+            extra_limit      REAL,
+            fable_pct        REAL
         )
     """)
+    try:
+        conn.execute("ALTER TABLE usage_log ADD COLUMN fable_pct REAL")
+    except sqlite3.OperationalError:
+        pass  # column already exists
     conn.commit()
     conn.close()
 
@@ -279,8 +357,8 @@ def log_usage(usage):
         conn.execute("""
             INSERT OR IGNORE INTO usage_log
               (ts, session_pct, weekly_pct, session_resets_at, weekly_resets_at,
-               extra_used, extra_limit)
-            VALUES (?,?,?,?,?,?,?)
+               extra_used, extra_limit, fable_pct)
+            VALUES (?,?,?,?,?,?,?,?)
         """, (
             ts,
             usage["session_pct"],
@@ -289,6 +367,7 @@ def log_usage(usage):
             usage.get("weekly_resets_at",  ""),
             usage.get("extra_used"),
             usage.get("extra_limit"),
+            usage.get("fable_pct"),
         ))
         conn.commit()
     finally:
@@ -899,19 +978,36 @@ def _conversations_dashboard_html(conversations):
         project = (c.get("project") or {}).get("name") or "—"
         updated = _relative_time(c.get("updated_at", ""))
         link = f"https://claude.ai/chat/{uuid}" if uuid else "#"
+        st = c.get("_stats") or {}
+        turns  = st.get("turns", "—")
+        tokens = _fmt_tokens(st.get("est_tokens")) if st else "—"
+        think  = _fmt_tokens(st.get("thinking_tokens")) if st.get("thinking_tokens") else "—"
+        tools  = st.get("tool_calls") or "—"
         rows_html += f"""
         <tr>
           <td><a href="{link}" target="_blank">{name}</a></td>
           <td>{model}</td>
           <td>{project}</td>
+          <td style="text-align:right">{turns}</td>
+          <td style="text-align:right">{tokens}</td>
+          <td style="text-align:right">{think}</td>
+          <td style="text-align:right">{tools}</td>
           <td>{updated}</td>
         </tr>"""
 
     return f"""
     <div class="card">
       <h2>Recent Conversations</h2>
+      <p style="font-size:.75rem;color:var(--muted);margin-bottom:10px">
+        Token counts are estimated from message length (~4 chars/token), including thinking and tool traffic.
+      </p>
       <table class="conv-table">
-        <thead><tr><th>Name</th><th>Model</th><th>Project</th><th>Updated</th></tr></thead>
+        <thead><tr><th>Name</th><th>Model</th><th>Project</th>
+          <th style="text-align:right">Turns</th>
+          <th style="text-align:right">~Tokens</th>
+          <th style="text-align:right">Thinking</th>
+          <th style="text-align:right">Tools</th>
+          <th>Updated</th></tr></thead>
         <tbody>{rows_html}</tbody>
       </table>
     </div>"""
@@ -921,6 +1017,7 @@ def _conversations_dashboard_html(conversations):
 
 # Rough cost weights per model (relative to Sonnet = 1.0)
 MODEL_COST_WEIGHT = {
+    "claude-sonnet-5":   1.0,
     "claude-sonnet-4-6": 1.0,
     "claude-sonnet-4-5": 1.0,
     "claude-haiku-4-5":  0.15,
@@ -947,18 +1044,24 @@ def _conversation_insights_html(conversations):
         uuid = c.get("uuid", "")
         updated = c.get("updated_at", "")
 
-        # Estimate "size" from created_at vs updated_at span
-        created = c.get("created_at", updated)
-        try:
-            created_dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
-            updated_dt = datetime.fromisoformat(updated.replace("Z", "+00:00"))
-            duration_hrs = max((updated_dt - created_dt).total_seconds() / 3600, 0.1)
-        except Exception:
-            duration_hrs = 1.0
-
-        # Longer conversations on heavier models = more expensive
-        # This is a rough heuristic but directionally useful
-        estimated_cost = weight * min(duration_hrs, 24)  # cap at 24h
+        st = c.get("_stats") or {}
+        est_tokens = st.get("est_tokens")
+        if est_tokens:
+            # Real signal: estimated tokens weighted by model cost
+            estimated_cost = weight * est_tokens
+            detail_str = (f"{_fmt_tokens(est_tokens)} tok · {st.get('turns', 0)} turns"
+                          + (f" · {st.get('tool_calls')} tools" if st.get("tool_calls") else ""))
+        else:
+            # Fallback heuristic: created→updated span as a proxy for size
+            created = c.get("created_at", updated)
+            try:
+                created_dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                updated_dt = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+                duration_hrs = max((updated_dt - created_dt).total_seconds() / 3600, 0.1)
+            except Exception:
+                duration_hrs = 1.0
+            estimated_cost = weight * min(duration_hrs, 24) * 1000  # rough token-scale parity
+            detail_str = f"{duration_hrs:.1f}h"
 
         if len(name) > 45:
             name = name[:42] + "..."
@@ -968,7 +1071,7 @@ def _conversation_insights_html(conversations):
             "uuid": uuid,
             "model": model_label,
             "weight": weight,
-            "duration_hrs": duration_hrs,
+            "detail": detail_str,
             "cost": estimated_cost,
         })
 
@@ -987,7 +1090,7 @@ def _conversation_insights_html(conversations):
           <div style="flex:1;min-width:0">
             <a href="{link}" target="_blank" style="color:var(--accent);text-decoration:none;font-size:.85rem;
                white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block">{c['name']}</a>
-            <div style="font-size:.7rem;color:var(--muted)">{c['model']} · {c['duration_hrs']:.1f}h · {label}</div>
+            <div style="font-size:.7rem;color:var(--muted)">{c['model']} · {c['detail']} · {label}</div>
           </div>
           <div style="width:80px;background:var(--border);border-radius:4px;height:6px;flex-shrink:0">
             <div style="width:{bar_width:.0f}%;background:{bar_color};border-radius:4px;height:100%"></div>
@@ -1006,7 +1109,7 @@ def _conversation_insights_html(conversations):
     <div class="card">
       <h2>Conversation Cost Ranking (Estimated)</h2>
       <p style="font-size:.75rem;color:var(--muted);margin-bottom:10px">
-        Ranked by model weight x duration. Longer Opus conversations cost more.
+        Ranked by estimated tokens × model cost weight. Trim or restart your heaviest conversations to save credits.
       </p>
       {rows}
       <div style="font-size:.75rem;color:var(--muted);margin-top:12px;padding-top:8px;border-top:1px solid var(--border)">
@@ -1202,12 +1305,18 @@ def _power_user_dashboard_html(usage, stats, velocity, runway, msg_est):
 def generate_dashboard(usage, stats, conversations=None):
     spct     = usage["session_pct"]
     wpct     = usage["weekly_pct"]
-    sreset   = _fmt_reset(usage.get("session_resets_at", ""))
-    wreset   = _fmt_reset(usage.get("weekly_resets_at",  ""))
+    sreset       = _fmt_reset(usage.get("session_resets_at", ""))
+    sreset_clock = _fmt_reset_clock(usage.get("session_resets_at", ""))
+    wreset       = _fmt_reset(usage.get("weekly_resets_at",  ""))
+    wreset_clock = _fmt_reset_clock(usage.get("weekly_resets_at",  ""))
     eu       = usage.get("extra_used")
     el       = usage.get("extra_limit")
     tip      = _tip(usage, stats)
     now_str  = datetime.now().strftime("%b %d, %Y  %I:%M %p")
+
+    history_rows = load_history()
+    velocity     = calc_velocity(history_rows)
+    projections  = calc_projections(usage, velocity)
 
     # Colour for weekly bar
     if wpct >= 85:
@@ -1363,10 +1472,7 @@ def generate_dashboard(usage, stats, conversations=None):
     conversations_html = _conversations_dashboard_html(conversations)
 
     # Power-user analytics
-    history_rows = load_history()
-    velocity = calc_velocity(history_rows)
     runway = calc_runway(usage, velocity)
-    projections = calc_projections(usage, velocity)
     msg_est = estimate_messages_remaining(usage, history_rows)
     power_user_html = _power_user_dashboard_html(usage, stats, velocity, runway, msg_est)
 
@@ -1467,7 +1573,7 @@ def generate_dashboard(usage, stats, conversations=None):
     <div class="big">{spct:.0f}%</div>
     <div class="bar-wrap"><div class="bar" style="width:{min(spct,100):.1f}%;background:#0D9488"></div></div>
     <div class="bar-labels"><span>used</span><span>100%</span></div>
-    <div class="reset-badge">{f"resets in {sreset}" if sreset else ""}</div>
+    <div class="reset-badge">{f"resets in {sreset}" + (f" · {sreset_clock}" if sreset_clock else "") if sreset else ""}</div>
     {s_proj_html}
   </div>
   <div class="card">
@@ -1475,7 +1581,7 @@ def generate_dashboard(usage, stats, conversations=None):
     <div class="big" style="color:{w_color}">{wpct:.0f}%</div>
     <div class="bar-wrap"><div class="bar" style="width:{min(wpct,100):.1f}%;background:{w_color}"></div></div>
     <div class="bar-labels"><span>used</span><span>100%</span></div>
-    <div class="reset-badge">{f"resets in {wreset}" if wreset else ""}</div>
+    <div class="reset-badge">{f"resets in {wreset}" + (f" · {wreset_clock}" if wreset_clock else "") if wreset else ""}</div>
     <div class="proj">{proj_str}</div>
     {w_proj_html}
   </div>
@@ -1548,6 +1654,18 @@ def _fmt_reset(iso_str):
             return f"{h}h {m:02d}m"
         d, h = divmod(h, 24)
         return f"{d}d {h}h"
+    except Exception:
+        return ""
+
+
+def _fmt_reset_clock(iso_str):
+    """Return the local wall-clock time of a reset, e.g. '3:45 PM'."""
+    if not iso_str:
+        return ""
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        local = dt.astimezone()
+        return local.strftime("%-I:%M %p")
     except Exception:
         return ""
 
@@ -1659,12 +1777,23 @@ def _build_title(usage, config, velocity=None, recent_session_pcts=None):
                 d = velocity["weekly_delta"]
                 w_str += f"+{d:.0f}" if d > 0 else f"{d:.0f}"
         parts.append(w_str)
+    if config.get("show_fable_usage"):
+        fpct = usage.get("fable_pct")
+        if fpct is not None:
+            parts.append(f"F{fpct:.0f}%")
     title = " | ".join(parts) if parts else "◈"
     if full_detail:
+        _r_parts = []
         if config.get("show_reset_time"):
             reset = _fmt_reset(usage.get("session_resets_at", ""))
             if reset:
-                title += f"  ↺{reset}"
+                _r_parts.append(reset)
+        if config.get("show_reset_clock"):
+            reset_clock = _fmt_reset_clock(usage.get("session_resets_at", ""))
+            if reset_clock:
+                _r_parts.append(reset_clock)
+        if _r_parts:
+            title += "  ↺" + " · ".join(_r_parts)
         # Sparkline appended last so it doesn't push reset time off screen
         if config.get("show_sparkline", True) and config.get("show_session_pct") and recent_session_pcts and len(recent_session_pcts) >= 3:
             title += _sparkline(recent_session_pcts)
@@ -1700,12 +1829,14 @@ def _build_tooltip(usage, velocity=None, runway=None, msg_est=None):
         return "ClaudeMonitor — no data"
     spct = usage.get("session_pct", 0)
     wpct = usage.get("weekly_pct",  0)
-    sr   = _fmt_reset(usage.get("session_resets_at", ""))
-    wr   = _fmt_reset(usage.get("weekly_resets_at",  ""))
+    sr    = _fmt_reset(usage.get("session_resets_at", ""))
+    sr_at = _fmt_reset_clock(usage.get("session_resets_at", ""))
+    wr    = _fmt_reset(usage.get("weekly_resets_at",  ""))
+    wr_at = _fmt_reset_clock(usage.get("weekly_resets_at",  ""))
     lines = [
         "ClaudeMonitor",
-        f"Session (5h):  {spct:.0f}%" + (f"  —  resets in {sr}" if sr else ""),
-        f"Weekly  (7d):  {wpct:.0f}%" + (f"  —  resets in {wr}" if wr else ""),
+        f"Session (5h):  {spct:.0f}%" + (f"  —  resets in {sr}" + (f" ({sr_at})" if sr_at else "") if sr else ""),
+        f"Weekly  (7d):  {wpct:.0f}%" + (f"  —  resets in {wr}" + (f" ({wr_at})" if wr_at else "") if wr else ""),
     ]
     # Velocity
     if velocity and velocity["session_velocity"] > 0.1:
@@ -1768,10 +1899,12 @@ class ClaudeMonitorApp(rumps.App):
         # Settings checkmark items
         self._s_session   = rumps.MenuItem("Session % (5h)", callback=self._toggle("show_session_pct"))
         self._s_weekly    = rumps.MenuItem("Weekly % (7d)",  callback=self._toggle("show_weekly_pct"))
-        self._s_reset     = rumps.MenuItem("Reset time",     callback=self._toggle("show_reset_time"))
+        self._s_reset      = rumps.MenuItem("Reset countdown", callback=self._toggle("show_reset_time"))
+        self._s_reset_clock = rumps.MenuItem("Reset clock time", callback=self._toggle("show_reset_clock"))
         self._s_sparkline = rumps.MenuItem("Sparkline",      callback=self._toggle("show_sparkline"))
         self._s_tooltip   = rumps.MenuItem("Hover tooltip",  callback=self._toggle("show_hover_tooltip"))
         self._s_notif     = rumps.MenuItem("Notifications",  callback=self._toggle("notifications_enabled"))
+        self._s_fable     = rumps.MenuItem("Fable usage",    callback=self._toggle("show_fable_usage"))
         self._sync_checkmarks()
 
         # Display size submenu
@@ -1791,12 +1924,16 @@ class ClaudeMonitorApp(rumps.App):
             self._s_session,
             self._s_weekly,
             self._s_reset,
+            self._s_reset_clock,
             self._s_sparkline,
             None,
             display_size_menu,
             None,
             self._s_tooltip,
             self._s_notif,
+            None,
+            rumps.MenuItem("Optional models:", callback=None),
+            self._s_fable,
         ])
 
         # Model guide submenu
@@ -1960,10 +2097,12 @@ class ClaudeMonitorApp(rumps.App):
     def _sync_checkmarks(self):
         self._s_session.state   = int(bool(self.config.get("show_session_pct",   True)))
         self._s_weekly.state    = int(bool(self.config.get("show_weekly_pct",    True)))
-        self._s_reset.state     = int(bool(self.config.get("show_reset_time",    False)))
+        self._s_reset.state       = int(bool(self.config.get("show_reset_time",  False)))
+        self._s_reset_clock.state = int(bool(self.config.get("show_reset_clock", False)))
         self._s_sparkline.state = int(bool(self.config.get("show_sparkline",     True)))
         self._s_tooltip.state   = int(bool(self.config.get("show_hover_tooltip", True)))
         self._s_notif.state     = int(bool(self.config.get("notifications_enabled", True)))
+        self._s_fable.state     = int(bool(self.config.get("show_fable_usage",   False)))
 
     # ── Display size ──
 
@@ -2007,7 +2146,7 @@ class ClaudeMonitorApp(rumps.App):
     def open_dashboard(self, _):
         if self._usage:
             path = generate_dashboard(self._usage, self._stats, getattr(self, "_conversations", None))
-            webbrowser.open(f"file://{path}")
+            subprocess.Popen(["open", path])
         else:
             rumps.notification("ClaudeMonitor", "No data yet", "Fetching usage now…")
             threading.Thread(target=self._refresh, daemon=True).start()
@@ -2158,6 +2297,7 @@ class ClaudeMonitorApp(rumps.App):
             # thread-safety issues and rate limiting.
             debug_info["stage"] = "fetching_details"
             enriched = {}  # uuid -> actual_model
+            conv_stats = {}  # uuid -> usage stats extracted from messages
             detail_errors = []
 
             # Only fetch detail for first conversation to diagnose, then apply to all
@@ -2199,6 +2339,7 @@ class ClaudeMonitorApp(rumps.App):
                             debug_info["extracted_model"] = model
                         else:
                             debug_info["extracted_model"] = "(empty)"
+                        conv_stats[first_uuid] = _extract_conv_stats(detail)
                     else:
                         debug_info["detail_body_preview"] = detail_resp.text[:500]
                 except Exception as e:
@@ -2220,6 +2361,7 @@ class ClaudeMonitorApp(rumps.App):
                         model = self._extract_actual_model(detail)
                         if model:
                             enriched[uuid] = model
+                        conv_stats[uuid] = _extract_conv_stats(detail)
                 except Exception as e:
                     detail_errors.append({"uuid": uuid[:8], "error": str(e)})
 
@@ -2228,11 +2370,13 @@ class ClaudeMonitorApp(rumps.App):
             if detail_errors:
                 debug_info["detail_errors"] = detail_errors[:5]
 
-            # Set _actual_model on each conversation object
+            # Set _actual_model and _stats on each conversation object
             for conv in conversations:
                 uuid = conv.get("uuid", "")
                 if uuid in enriched:
                     conv["_actual_model"] = enriched[uuid]
+                if uuid in conv_stats:
+                    conv["_stats"] = conv_stats[uuid]
 
             debug_info["stage"] = "done"
             return conversations
@@ -2307,6 +2451,17 @@ class ClaudeMonitorApp(rumps.App):
                 rumps.notification("ClaudeMonitor", f"Weekly usage at {t}%",
                                    f"Resets in {wr}." if wr else "")
 
+        fable = usage.get("per_model", {}).get("Fable")
+        if fable:
+            fpct   = fable.get("utilization") or 0
+            freset = _fmt_reset(fable.get("resets_at", ""))
+            for t in WEEKLY_THRESHOLDS:
+                key = f"fable_{t}_{fable.get('resets_at', '')}"
+                if fpct >= t and key not in self._notified:
+                    self._notified.add(key)
+                    rumps.notification("ClaudeMonitor", f"Fable weekly usage at {t}%",
+                                       f"Resets in {freset}." if freset else "")
+
         extra_pct = usage.get("extra_pct")
         if extra_pct is not None:
             eu = usage.get("extra_used", 0)
@@ -2374,11 +2529,18 @@ class ClaudeMonitorApp(rumps.App):
 
         spct   = usage["session_pct"]
         wpct   = usage["weekly_pct"]
-        sreset = _fmt_reset(usage["session_resets_at"])
-        wreset = _fmt_reset(usage["weekly_resets_at"])
+        sreset       = _fmt_reset(usage["session_resets_at"])
+        sreset_clock = _fmt_reset_clock(usage["session_resets_at"])
+        wreset       = _fmt_reset(usage["weekly_resets_at"])
+        wreset_clock = _fmt_reset_clock(usage["weekly_resets_at"])
 
         self.menu[session_header].title = f"⬤  Session (5h) — {spct:.1f}%"
-        self.menu[session_detail].title = f"   resets in {sreset}" if sreset else "   —"
+        _s_parts = []
+        if self.config.get("show_reset_time") and sreset:
+            _s_parts.append(f"resets in {sreset}")
+        if self.config.get("show_reset_clock") and sreset_clock:
+            _s_parts.append(sreset_clock)
+        self.menu[session_detail].title = "   " + "  ·  ".join(_s_parts) if _s_parts else "   —"
 
         # Session runway
         if runway and runway.get("session_runway_min") is not None:
@@ -2398,10 +2560,12 @@ class ClaudeMonitorApp(rumps.App):
 
         self.menu[weekly_header].title  = f"⬤  Weekly (7d) — {wpct:.1f}%"
 
-        if wreset:
-            self.menu[weekly_detail].title = f"   resets in {wreset}"
-        else:
-            self.menu[weekly_detail].title = "   —  "
+        _w_parts = []
+        if self.config.get("show_reset_time") and wreset:
+            _w_parts.append(f"resets in {wreset}")
+        if self.config.get("show_reset_clock") and wreset_clock:
+            _w_parts.append(wreset_clock)
+        self.menu[weekly_detail].title = "   " + "  ·  ".join(_w_parts) if _w_parts else "   —  "
 
         # Weekly runway
         if runway and runway.get("weekly_runway_min") is not None:
@@ -2426,6 +2590,10 @@ class ClaudeMonitorApp(rumps.App):
             parts.append(f"Sonnet: {per_model['Sonnet']['utilization']:.1f}%")
         if "Opus" in per_model:
             parts.append(f"Opus: {per_model['Opus']['utilization']:.1f}%")
+        if "Fable" in per_model and self.config.get("show_fable_usage"):
+            fp = per_model["Fable"]["utilization"]
+            warn = "⚠️ " if fp >= 85 else ""
+            parts.append(f"{warn}Fable: {fp:.1f}%")
         if parts:
             self.menu["   per_model_line"].title = "   " + "  ·  ".join(parts)
             self.menu["   per_model_line"].hidden = False
